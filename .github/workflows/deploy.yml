@@ -1,0 +1,14 @@
+name: deploy
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # TODO(A): 배포 대상(서버/클라우드)에 맞게 빌드·배포 단계 작성
+      - name: Build image
+        run: docker build -t today-rescue-back .

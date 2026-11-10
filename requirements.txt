@@ -1,0 +1,11 @@
+django
+djangorestframework
+django-cors-headers
+drf-spectacular
+python-dotenv
+dj-database-url
+psycopg2-binary
+requests
+apscheduler
+Pillow
+gunicorn
