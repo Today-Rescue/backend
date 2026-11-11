@@ -12,7 +12,7 @@ def env_list(key, default=""):
     return [v.strip() for v in os.getenv(key, default).split(",") if v.strip()]
 
 
-SECRET_KEY = os.getenv("DJANGO_SECRET_KEY", "dev-insecure-key")
+SECRET_KEY = os.getenv("DJANGO_SECRET_KEY") or "dev-insecure-key"  # 빈 값이어도 로컬 실행 가능
 DEBUG = os.getenv("DEBUG", "False") == "True"
 ALLOWED_HOSTS = env_list("ALLOWED_HOSTS", "localhost,127.0.0.1")
 
@@ -112,6 +112,7 @@ CORS_ALLOWED_ORIGINS = env_list("CORS_ALLOWED_ORIGINS", "http://localhost:5173")
 # 외부 API 키
 DATA_GO_KR_SERVICE_KEY = os.getenv("DATA_GO_KR_SERVICE_KEY", "")
 KAKAO_REST_API_KEY = os.getenv("KAKAO_REST_API_KEY", "")
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODELS = env_list("GEMINI_MODELS", "gemini-3-flash-preview,gemini-flash-lite-latest")  # 앞에서부터 시도
 
 DEMO_STORE_ID = 1
