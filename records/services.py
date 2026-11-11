@@ -1,6 +1,6 @@
 from datetime import date, timedelta
 
-from django.db.models import Avg, QuerySet
+from django.db.models import Avg, QuerySet, Sum
 
 from .models import DailyRecord
 
@@ -32,3 +32,19 @@ def recent_weekday_avg(store_id: int, target: date, weeks: int = 4) -> dict[int,
         .annotate(made_avg=Avg("made_qty"), left_avg=Avg("left_qty"))
     )
     return {r["item_id"]: {"made_avg": r["made_avg"], "left_avg": r["left_avg"]} for r in rows}
+
+
+def weekly_made_totals(store_id: int, target: date, days: int = 7) -> list[dict]:
+    """target 포함 최근 N일의 일별 총 생산량 [{date, made_total}] (기록 없는 날은 0)"""
+    start = target - timedelta(days=days - 1)
+    rows = (
+        DailyRecord.objects.filter(store_id=store_id, date__range=(start, target))
+        .values("date")
+        .annotate(total=Sum("made_qty"))
+    )
+    totals = {r["date"]: r["total"] for r in rows}
+    result = []
+    for i in range(days):
+        d = start + timedelta(days=i)
+        result.append({"date": d.isoformat(), "made_total": totals.get(d, 0)})
+    return result
