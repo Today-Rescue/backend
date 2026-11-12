@@ -12,12 +12,18 @@ from .models import ShelfScan
 from .serializers import ConfirmSerializer
 
 
+def _absolute(request, data: dict) -> dict:
+    data["image_url"] = request.build_absolute_uri(data["image_url"])
+    return data
+
+
 class ScanCreateView(APIView):
     """POST /stores/{id}/scans  (multipart: image)
 
-    응답 status
-    - ok: items에 가게 전체 품목별 수량 (못 찾은 품목은 0, found=false)
-    - too_dark / no_items: items 빈 배열 → 다시 찍기 안내
+    status
+    - ok: 모든 품목 인식 / partial: 일부만 인식 (found_count / total_count)
+    - failed: 찾은 품목 없음 / timeout: 20초 초과·통신 실패 / too_dark: 사진 어두움
+    어떤 status든 scan_id로 직접 입력 후 확정할 수 있음
     """
 
     parser_classes = [MultiPartParser]
@@ -28,12 +34,15 @@ class ScanCreateView(APIView):
         if not image:
             raise AppError("FILE_REQUIRED", "사진을 선택해 주세요")
         scan = services.create_scan(store, image)
-        return Response({
-            "scan_id": scan.id,
-            "status": scan.status,
-            "image_url": request.build_absolute_uri(scan.image_url),
-            "items": services.scan_items(scan),
-        }, status=201)
+        return Response(_absolute(request, services.scan_response(scan)), status=201)
+
+
+class ScanDetailView(APIView):
+    """GET /scans/{id}  스캔 결과 다시 보기"""
+
+    def get(self, request, pk):
+        scan = get_object_or_404(ShelfScan, pk=pk)
+        return Response(_absolute(request, services.scan_response(scan)))
 
 
 class ScanConfirmView(APIView):
