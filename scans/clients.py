@@ -5,16 +5,16 @@
 import base64
 import json
 import logging
+import time
 
 import requests
 from django.conf import settings
 
-from common.exceptions import ExternalAPIError
-
 logger = logging.getLogger(__name__)
 
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-TIMEOUT = 30  # 초. 넘으면 다음 모델로
+FALLBACK_RESERVE = 5  # 마지막 모델(빠른 모델)을 위해 남겨두는 시간(초)
+MIN_ATTEMPT_SECONDS = 2  # 남은 시간이 이보다 적으면 시도하지 않음
 
 RESPONSE_SCHEMA = {
     "type": "OBJECT",
@@ -27,9 +27,9 @@ RESPONSE_SCHEMA = {
                 "properties": {
                     "item_id": {"type": "INTEGER"},
                     "quantity": {"type": "INTEGER"},
-                    "uncertain": {"type": "BOOLEAN"},
+                    "confidence": {"type": "NUMBER"},
                 },
-                "required": ["item_id", "quantity", "uncertain"],
+                "required": ["item_id", "quantity", "confidence"],
             },
         },
     },
@@ -37,7 +37,11 @@ RESPONSE_SCHEMA = {
 }
 
 
-def _call(model: str, image_bytes: bytes, prompt: str) -> dict:
+class AITimeout(Exception):
+    """제한 시간 안에 어떤 모델도 응답하지 못함"""
+
+
+def _call(model: str, image_bytes: bytes, prompt: str, timeout: float) -> dict:
     res = requests.post(
         GEMINI_URL.format(model=model),
         headers={"x-goog-api-key": settings.GEMINI_API_KEY},
@@ -55,23 +59,27 @@ def _call(model: str, image_bytes: bytes, prompt: str) -> dict:
                 "responseSchema": RESPONSE_SCHEMA,
             },
         },
-        timeout=TIMEOUT,
+        timeout=timeout,
     )
     res.raise_for_status()
     text = res.json()["candidates"][0]["content"]["parts"][0]["text"]
     return json.loads(text)
 
 
-def analyze_shelf(image_bytes: bytes, prompt: str) -> tuple[dict, str]:
-    """진열대 사진 → ({status, items:[{item_id, quantity, uncertain}]}, 사용한 모델)
+def analyze_shelf(image_bytes: bytes, prompt: str, deadline: float) -> tuple[dict, str]:
+    """진열대 사진 → ({status, items:[{item_id, quantity, confidence}]}, 사용한 모델)
 
-    settings.GEMINI_MODELS 순서대로 시도하고, 모두 실패하면 ExternalAPIError(502)
+    settings.GEMINI_MODELS 순서대로 시도. deadline(time.monotonic 기준)까지 못 받으면 AITimeout
     """
-    last_error = None
-    for model in settings.GEMINI_MODELS:
+    models = settings.GEMINI_MODELS
+    for i, model in enumerate(models):
+        remaining = deadline - time.monotonic()
+        is_last = i == len(models) - 1
+        timeout = remaining if is_last else remaining - FALLBACK_RESERVE
+        if timeout < MIN_ATTEMPT_SECONDS:
+            continue
         try:
-            return _call(model, image_bytes, prompt), model
+            return _call(model, image_bytes, prompt, timeout=timeout), model
         except (requests.RequestException, KeyError, IndexError, ValueError) as e:
             logger.warning("gemini %s failed: %s", model, e)
-            last_error = e
-    raise ExternalAPIError("SCAN_AI_ERROR", "사진을 분석하지 못했어요. 잠시 후 다시 시도해 주세요") from last_error
+    raise AITimeout()

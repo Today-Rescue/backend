@@ -113,6 +113,6 @@ CORS_ALLOWED_ORIGINS = env_list("CORS_ALLOWED_ORIGINS", "http://localhost:5173")
 DATA_GO_KR_SERVICE_KEY = os.getenv("DATA_GO_KR_SERVICE_KEY", "")
 KAKAO_REST_API_KEY = os.getenv("KAKAO_REST_API_KEY", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODELS = env_list("GEMINI_MODELS", "gemini-3-flash-preview,gemini-flash-lite-latest")  # 앞에서부터 시도
+GEMINI_MODELS = env_list("GEMINI_MODELS", "gemini-3-flash-preview,gemini-3.1-flash-lite")  # 앞에서부터 시도
 
 DEMO_STORE_ID = 1

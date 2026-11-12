@@ -1,4 +1,5 @@
 import io
+import time
 from datetime import date
 from pathlib import Path
 
@@ -11,10 +12,15 @@ from records.services import update_left_qty
 from uploads.services import resize_image, save_bytes
 
 from . import clients
-from .models import ShelfScan
+from .models import ScanCount, ShelfScan
 
 PROMPT_PATH = Path(__file__).parent / "prompts" / "shelf_scan.txt"
 DARK_THRESHOLD = 35  # 평균 밝기(0~255)가 이보다 낮으면 AI 호출 없이 too_dark
+TIME_LIMIT = 20  # 초. 넘으면 timeout (CP-04)
+CONFIDENCE_THRESHOLD = 0.7  # 이보다 낮으면 "개수 확인 필요" (SR-06)
+
+Status = ShelfScan.Status
+CONFIRMABLE = {Status.OK, Status.PARTIAL, Status.FAILED, Status.TIMEOUT, Status.TOO_DARK}
 
 
 def load_prompt(items) -> str:
@@ -27,52 +33,40 @@ def is_too_dark(image_bytes: bytes) -> bool:
     return ImageStat.Stat(img).mean[0] < DARK_THRESHOLD
 
 
-def clean_result(raw: dict, items) -> tuple[str, list[dict]]:
-    """AI 응답 검증 → (status, 가게 전체 품목별 결과)
+def parse_result(raw: dict, valid_ids: set[int]) -> tuple[str, dict[int, dict]]:
+    """AI 응답 검증 → (AI status, {item_id: {quantity, confidence}})
 
-    - 가게에 없는 item_id는 버림, 같은 품목이 여러 번 오면 합침
-    - 음수는 0으로
-    - 사진에서 못 찾은 품목은 quantity 0 (found=False)
+    가게에 없는 item_id는 버리고, 같은 품목이 여러 번 오면 합치고(확신도는 낮은 쪽), 음수는 0
     """
     status = raw.get("status")
-    if status not in (ShelfScan.Status.OK, ShelfScan.Status.TOO_DARK, ShelfScan.Status.NO_ITEMS):
+    if status not in ("ok", "too_dark", "no_items"):
         raise ValueError(f"invalid status: {status}")
 
     found: dict[int, dict] = {}
-    valid_ids = {it.id for it in items}
     for row in raw.get("items") or []:
         item_id = int(row["item_id"])
         if item_id not in valid_ids:
             continue
         qty = max(int(row["quantity"]), 0)
-        prev = found.get(item_id)
-        if prev:
-            prev["quantity"] += qty
-            prev["uncertain"] = prev["uncertain"] or bool(row.get("uncertain"))
+        conf = min(max(float(row["confidence"]), 0.0), 1.0)
+        if item_id in found:
+            found[item_id]["quantity"] += qty
+            found[item_id]["confidence"] = min(found[item_id]["confidence"], conf)
         else:
-            found[item_id] = {"quantity": qty, "uncertain": bool(row.get("uncertain"))}
+            found[item_id] = {"quantity": qty, "confidence": conf}
+    return status, found
 
-    if status == ShelfScan.Status.OK and not found:
-        status = ShelfScan.Status.NO_ITEMS
-    if status != ShelfScan.Status.OK:
-        return status, []
 
-    result = []
-    for it in items:
-        f = found.get(it.id)
-        result.append({
-            "item_id": it.id,
-            "name": it.name,
-            "image_url": it.image_url,
-            "quantity": f["quantity"] if f else 0,
-            "uncertain": f["uncertain"] if f else False,
-            "found": bool(f),
-        })
-    return status, result
+def scan_status(ai_status: str, found: dict, total: int) -> str:
+    if ai_status == "too_dark":
+        return Status.TOO_DARK
+    if not found:
+        return Status.FAILED
+    return Status.OK if len(found) == total else Status.PARTIAL
 
 
 def create_scan(store, image_file) -> ShelfScan:
-    """사진 저장 → 밝기 확인 → AI 인식 → 검증(실패 시 다음 모델로 1번 더) → ShelfScan 저장"""
+    """사진 저장 → 밝기 확인 → AI 인식(20초 제한) → 품목별 ScanCount 저장"""
     items = list(Item.objects.filter(store=store, is_active=True).order_by("id"))
     if not items:
         raise AppError("NO_STORE_ITEMS", "먼저 판매 품목을 등록해 주세요")
@@ -80,58 +74,96 @@ def create_scan(store, image_file) -> ShelfScan:
     image_bytes = resize_image(image_file)
     scan = ShelfScan.objects.create(store=store, image_url=save_bytes(image_bytes, "scans"))
 
+    found: dict[int, dict] = {}
     if is_too_dark(image_bytes):
-        scan.status = ShelfScan.Status.TOO_DARK
-        scan.llm_result = {"items": [], "checked_by": "brightness"}
-        scan.save()
-        return scan
-
-    prompt = load_prompt(items)
-    last_error = None
-    for _ in range(2):  # 응답 형식이 틀리면 한 번 더
-        try:
-            raw, model = clients.analyze_shelf(image_bytes, prompt)
-            status, result = clean_result(raw, items)
-            break
-        except (ValueError, KeyError, TypeError) as e:
-            last_error = e
-        except AppError:
-            scan.status = ShelfScan.Status.ERROR
-            scan.save()
-            raise
+        scan.status = Status.TOO_DARK
+        scan.llm_result = {"checked_by": "brightness"}
     else:
-        scan.status = ShelfScan.Status.ERROR
-        scan.llm_result = {"error": str(last_error)}
-        scan.save()
-        raise AppError("SCAN_AI_ERROR", "사진을 분석하지 못했어요. 다시 찍어 주세요", 502)
+        deadline = time.monotonic() + TIME_LIMIT
+        prompt = load_prompt(items)
+        valid_ids = {it.id for it in items}
+        scan.status = Status.TIMEOUT
+        while time.monotonic() < deadline:  # 응답 형식이 틀리면 남은 시간 안에서 다시
+            try:
+                raw, model = clients.analyze_shelf(image_bytes, prompt, deadline)
+                ai_status, found = parse_result(raw, valid_ids)
+            except clients.AITimeout:
+                break
+            except (ValueError, KeyError, TypeError) as e:
+                scan.llm_result = {"error": str(e)}
+                continue
+            scan.status = scan_status(ai_status, found, len(items))
+            scan.model_name = model
+            scan.llm_result = raw
+            break
 
-    scan.status = status
-    scan.llm_result = {"raw": raw, "model": model, "items": result}
-    scan.save()
+    with transaction.atomic():
+        scan.save()
+        ScanCount.objects.bulk_create([
+            ScanCount(
+                scan=scan,
+                item=it,
+                detected_qty=found[it.id]["quantity"] if it.id in found else None,
+                confidence=found[it.id]["confidence"] if it.id in found else None,
+            )
+            for it in items
+        ])
     return scan
 
 
-def scan_items(scan: ShelfScan) -> list[dict]:
-    return (scan.llm_result or {}).get("items", [])
+def scan_response(scan: ShelfScan) -> dict:
+    """프론트 응답용. items는 가게 전체 품목 (못 찾은 품목이 맨 위, CP-05)"""
+    counts = list(scan.counts.select_related("item").order_by("item_id"))
+    items = []
+    for c in counts:
+        found = c.detected_qty is not None
+        items.append({
+            "item_id": c.item_id,
+            "name": c.item.name,
+            "image_url": c.item.image_url,
+            "found": found,
+            "quantity": c.confirmed_qty if c.confirmed_qty is not None else (c.detected_qty or 0),
+            "detected_qty": c.detected_qty,
+            "confidence": c.confidence,
+            "needs_check": (not found) or c.confidence < CONFIDENCE_THRESHOLD,
+        })
+    items.sort(key=lambda x: x["found"])  # 못 찾은 품목 먼저 (안정 정렬이라 나머지 순서 유지)
+    found_count = sum(1 for x in items if x["found"])
+    return {
+        "scan_id": scan.id,
+        "status": scan.status,
+        "image_url": scan.image_url,
+        "found_count": found_count,
+        "total_count": len(items),
+        "total_quantity": sum(x["quantity"] for x in items),
+        "items": items,
+    }
 
 
 @transaction.atomic
 def confirm_scan(scan: ShelfScan, target_date: date, items: list[dict]) -> None:
-    """사장님이 고친 수량 확정 → records.update_left_qty 호출"""
-    if scan.status == ShelfScan.Status.CONFIRMED:
-        raise AppError("SCAN_ALREADY_CONFIRMED", "이미 확정한 사진이에요")
-    if scan.status != ShelfScan.Status.OK:
-        raise AppError("SCAN_NOT_CONFIRMABLE", "인식에 성공한 사진만 확정할 수 있어요")
+    """사장님이 확인·수정한 수량 확정 → ScanCount.confirmed_qty 저장 + records.update_left_qty
 
-    valid_ids = set(Item.objects.filter(store=scan.store).values_list("id", flat=True))
+    인식 실패·시간 초과여도 직접 입력한 수량으로 확정할 수 있음 (CP-04, CP-06)
+    """
+    if scan.status == Status.CONFIRMED:
+        raise AppError("SCAN_ALREADY_CONFIRMED", "이미 확정한 사진이에요")
+    if scan.status not in CONFIRMABLE:
+        raise AppError("SCAN_NOT_CONFIRMABLE", "확정할 수 없는 사진이에요")
+
+    counts = {c.item_id: c for c in scan.counts.all()}
     quantities = {}
     for row in items:
-        if row["item_id"] not in valid_ids:
+        if row["item_id"] not in counts:
             raise AppError("ITEM_NOT_FOUND", "품목을 찾을 수 없어요", 404)
         quantities[row["item_id"]] = row["quantity"]
 
+    for item_id, qty in quantities.items():
+        c = counts[item_id]
+        c.confirmed_qty = qty
+        c.save(update_fields=["confirmed_qty"])
+
     update_left_qty(scan.store_id, target_date, quantities)
-    scan.status = ShelfScan.Status.CONFIRMED
-    scan.confirmed_result = {"date": target_date.isoformat(),
-                             "items": [{"item_id": k, "quantity": v} for k, v in quantities.items()]}
+    scan.status = Status.CONFIRMED
+    scan.confirmed_result = {"date": target_date.isoformat()}
     scan.save()
