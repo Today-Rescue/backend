@@ -8,7 +8,8 @@ from items.models import Item
 from records.models import DailyRecord
 from scans.models import ScanCount
 
-from .models import CampaignItem, SaleCampaign
+from . import bundles, clients
+from .models import Bundle, BundleItem, CampaignItem, SaleCampaign
 
 DISCOUNT_RATES = (20, 30, 40, 50)
 
@@ -83,6 +84,8 @@ def _ensure_active(campaign: SaleCampaign) -> None:
 def update_discount(campaign: SaleCampaign, rate: int | None, item_ids: list[int] | None) -> SaleCampaign:
     """할인율·대상 품목 변경 (SL 화면 [할인율·품목 변경], LV-04 할인율 올리기)"""
     _ensure_active(campaign)
+    if campaign.type != SaleCampaign.Type.DISCOUNT:
+        raise AppError("NOT_DISCOUNT", "일괄 할인만 수정할 수 있어요")
     if rate is not None:
         campaign.discount_rate = rate
         campaign.save(update_fields=["discount_rate", "updated_at"])
@@ -124,9 +127,20 @@ def campaign_response(campaign: SaleCampaign) -> dict:
             "sale_price": ci.sale_price,
             "start_qty": ci.start_qty,
         })
+    bundle = None
+    if campaign.type == SaleCampaign.Type.BUNDLE and hasattr(campaign, "bundle"):
+        b = campaign.bundle
+        bundle = {
+            "name": b.name,
+            "price": b.price,
+            "packs": b.packs,
+            "composition": [{"item_id": bi.item_id, "name": bi.item.name, "per_pack": bi.per_pack}
+                            for bi in b.items.select_related("item").order_by("item_id")],
+        }
     return {
         "id": campaign.id,
         "type": campaign.type,
+        "bundle": bundle,
         "status": campaign.status,
         "discount_rate": campaign.discount_rate,
         "channel": campaign.channel,
@@ -138,3 +152,99 @@ def campaign_response(campaign: SaleCampaign) -> dict:
         "total_qty": sum(x["start_qty"] or 0 for x in items),
         "items": items,
     }
+
+
+# ── 세트 (BX) ─────────────────────────────────────────
+def _bundle_stocks(store_id: int, rows: list[dict]) -> tuple[dict[int, Item], dict[int, int]]:
+    """[{item_id, qty?}] → (품목, 재고). qty가 없으면 지금 남은 수량으로"""
+    items = {it.id: it for it in _store_items(store_id, [r["item_id"] for r in rows])}
+    left = current_left_qty(store_id, list(items))
+    stocks = {}
+    for r in rows:
+        qty = r.get("qty")
+        if qty is None:
+            qty = left.get(r["item_id"])
+        if qty is None:
+            raise AppError("STOCK_UNKNOWN", f"{items[r['item_id']].name}의 남은 수량을 알 수 없어요")
+        stocks[r["item_id"]] = qty
+    return items, stocks
+
+
+def _composition_response(items: dict[int, Item], stocks: dict[int, int], comp: dict) -> dict:
+    prices = {i: items[i].price for i in comp["per_pack"]}
+    unit_total, rec_price = bundles.recommended_price(prices, comp["per_pack"])
+    return {
+        "items": [
+            {"item_id": i, "name": items[i].name, "price": items[i].price, "stock": stocks[i],
+             "per_pack": comp["per_pack"][i], "leftover": comp["leftover_by_item"][i]}
+            for i in sorted(comp["per_pack"])
+        ],
+        "packs": comp["packs"],
+        "leftover": comp["leftover"],
+        "unit_total": unit_total,  # 한 팩 단품 판매가 합계
+        "recommended_price": rec_price,
+    }
+
+
+def _default_name(items: dict[int, Item], per_pack: dict[int, int]) -> str:
+    return "·".join(items[i].name for i in sorted(per_pack)) + " 럭키박스"
+
+
+def recommend_bundles(store, item_ids: list[int] | None) -> list[dict]:
+    """추천 세트 (BX-01). item_ids를 주면 그 품목으로 1개, 없으면 재고 많은 품목 위주로 최대 3개"""
+    if item_ids:
+        items, stocks = _bundle_stocks(store.id, [{"item_id": i} for i in item_ids])
+        comp = bundles.best_composition(stocks)
+        comps = [comp] if comp else []
+    else:
+        all_items = list(Item.objects.filter(store=store, is_active=True))
+        items = {it.id: it for it in all_items}
+        stocks = current_left_qty(store.id, list(items))
+        comps = bundles.candidate_sets(stocks)
+    if not comps:
+        raise AppError("BUNDLE_NOT_POSSIBLE", "세트를 만들 만큼 남은 빵이 없어요")
+
+    results = [_composition_response(items, stocks, c) for c in comps]
+    names = clients.generate_names([
+        [f"{x['name']} {x['per_pack']}개" for x in r["items"]] for r in results
+    ])
+    for r, c, i in zip(results, comps, range(len(results))):
+        r["name"] = names[i] if names else _default_name(items, c["per_pack"])
+    return results
+
+
+def calculate_bundle(store, rows: list[dict]) -> dict:
+    """사장님이 고른 구성 계산 (BX-02, BX-03) + 더 적게 남는 구성이 있으면 better로"""
+    items, stocks = _bundle_stocks(store.id, rows)
+    per_pack = {r["item_id"]: r["per_pack"] for r in rows}
+    current = bundles.evaluate(stocks, per_pack)
+    result = _composition_response(items, stocks, {"per_pack": per_pack, **current})
+    best = bundles.best_composition(stocks)
+    better = None
+    if best and (best["leftover"], -best["packs"]) < (current["leftover"], -current["packs"]):
+        better = _composition_response(items, stocks, best)
+    result["better"] = better
+    return result
+
+
+@transaction.atomic
+def start_bundle(store, name: str, price: int, rows: list[dict], ends_at: datetime | None) -> SaleCampaign:
+    """세트 판매 시작 (BX-05)"""
+    items, stocks = _bundle_stocks(store.id, rows)
+    per_pack = {r["item_id"]: r["per_pack"] for r in rows}
+    packs = bundles.evaluate(stocks, per_pack)["packs"]
+    if packs < 1:
+        raise AppError("BUNDLE_NOT_POSSIBLE", "남은 빵으로 한 팩도 만들 수 없어요")
+    now = timezone.now()
+    if ends_at and ends_at <= now:
+        raise AppError("INVALID_END_TIME", "종료 시각은 지금 이후여야 해요")
+
+    campaign = SaleCampaign.objects.create(store=store, type=SaleCampaign.Type.BUNDLE,
+                                           started_at=now, ends_at=ends_at)
+    CampaignItem.objects.bulk_create([
+        CampaignItem(campaign=campaign, item=items[i], sale_price=items[i].price, start_qty=stocks[i])
+        for i in per_pack
+    ])
+    bundle = Bundle.objects.create(campaign=campaign, name=name, price=price, packs=packs)
+    BundleItem.objects.bulk_create([BundleItem(bundle=bundle, item=items[i], per_pack=n) for i, n in per_pack.items()])
+    return campaign

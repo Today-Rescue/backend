@@ -40,3 +40,21 @@ class CampaignItem(models.Model):
 
     class Meta:
         unique_together = ("campaign", "item")
+
+
+class Bundle(models.Model):
+    """세트(럭키박스) 정보. type=bundle 캠페인에 하나"""
+
+    campaign = models.OneToOneField(SaleCampaign, on_delete=models.CASCADE, related_name="bundle")
+    name = models.CharField(max_length=50)
+    price = models.IntegerField()  # 한 팩 판매가 (원)
+    packs = models.IntegerField()  # 만든 팩 수
+
+
+class BundleItem(models.Model):
+    bundle = models.ForeignKey(Bundle, on_delete=models.CASCADE, related_name="items")
+    item = models.ForeignKey("items.Item", on_delete=models.PROTECT)
+    per_pack = models.IntegerField()  # 팩당 개수
+
+    class Meta:
+        unique_together = ("bundle", "item")

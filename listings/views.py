@@ -10,7 +10,14 @@ from stores.models import Store
 
 from . import services
 from .models import SaleCampaign
-from .serializers import CampaignStatusSerializer, DiscountCreateSerializer, DiscountUpdateSerializer
+from .serializers import (
+    BundleCalculateSerializer,
+    BundleCreateSerializer,
+    BundleRecommendSerializer,
+    CampaignStatusSerializer,
+    DiscountCreateSerializer,
+    DiscountUpdateSerializer,
+)
 
 
 class StoreCampaignView(APIView):
@@ -66,3 +73,35 @@ class CampaignStatusView(APIView):
         s.is_valid(raise_exception=True)
         services.stop_campaign(campaign, s.validated_data["status"])
         return Response(services.campaign_response(campaign))
+
+
+class BundleRecommendView(APIView):
+    """POST /stores/{id}/bundles/recommend  body: {item_ids?}  → 추천 세트 최대 3개 (BX-01)"""
+
+    def post(self, request, store_id):
+        store = get_object_or_404(Store, pk=store_id)
+        s = BundleRecommendSerializer(data=request.data)
+        s.is_valid(raise_exception=True)
+        return Response(services.recommend_bundles(store, s.validated_data.get("item_ids")))
+
+
+class BundleCalculateView(APIView):
+    """POST /stores/{id}/bundles/calculate  body: {items:[{item_id, per_pack, qty?}]}  (BX-02, BX-03)"""
+
+    def post(self, request, store_id):
+        store = get_object_or_404(Store, pk=store_id)
+        s = BundleCalculateSerializer(data=request.data)
+        s.is_valid(raise_exception=True)
+        return Response(services.calculate_bundle(store, s.validated_data["items"]))
+
+
+class StoreBundleView(APIView):
+    """POST /stores/{id}/campaigns/bundle  body: {name, price, items:[{item_id, per_pack, qty?}], ends_at?}"""
+
+    def post(self, request, store_id):
+        store = get_object_or_404(Store, pk=store_id)
+        s = BundleCreateSerializer(data=request.data)
+        s.is_valid(raise_exception=True)
+        d = s.validated_data
+        campaign = services.start_bundle(store, d["name"], d["price"], d["items"], d.get("ends_at"))
+        return Response(services.campaign_response(campaign), status=201)
