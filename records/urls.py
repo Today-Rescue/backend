@@ -1,6 +1,6 @@
 from django.urls import path, register_converter
 
-from . import views
+from . import production, views
 
 
 class DateConverter:
@@ -20,4 +20,5 @@ urlpatterns = [
     path("stores/<int:store_id>/records", views.RecordListView.as_view()),
     path("stores/<int:store_id>/records/calendar", views.CalendarView.as_view()),
     path("stores/<int:store_id>/records/<date:date>", views.RecordUpsertView.as_view()),
+    path("stores/<int:store_id>/productions", production.ProductionView.as_view()),
 ]
