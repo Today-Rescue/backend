@@ -37,3 +37,21 @@ class ScanCount(models.Model):
 
     class Meta:
         unique_together = ("scan", "item")
+
+
+class RiskSnapshot(models.Model):
+    """재고 스캔(close) 확정 시점의 품목별 위험도 (SR-03·04, 원터치 할인 대상)"""
+
+    class Level(models.TextChoices):
+        DANGER = "danger"  # 위험
+        CAUTION = "caution"  # 주의
+        SAFE = "safe"  # 여유
+
+    scan = models.ForeignKey(ShelfScan, on_delete=models.CASCADE, related_name="risks")
+    item = models.ForeignKey("items.Item", on_delete=models.CASCADE)
+    expected_left = models.IntegerField()  # 마감 시점 예상 잔여
+    level = models.CharField(max_length=10, choices=Level.choices)
+    reason = models.CharField(max_length=100)
+
+    class Meta:
+        unique_together = ("scan", "item")

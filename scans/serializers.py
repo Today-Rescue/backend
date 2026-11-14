@@ -8,6 +8,10 @@ class ConfirmItemSerializer(serializers.Serializer):
     quantity = serializers.IntegerField(min_value=0)
 
 
+class RiskPreviewSerializer(serializers.Serializer):
+    items = ConfirmItemSerializer(many=True, allow_empty=False)
+
+
 class ConfirmSerializer(serializers.Serializer):
     date = serializers.DateField()
     purpose = serializers.ChoiceField(choices=ShelfScan.Purpose.choices, required=False)

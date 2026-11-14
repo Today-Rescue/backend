@@ -6,5 +6,6 @@ urlpatterns = [
     path("stores/<int:store_id>/scans", views.ScanCreateView.as_view()),
     path("stores/<int:store_id>/scans/purpose", views.ScanPurposeView.as_view()),
     path("scans/<int:pk>", views.ScanDetailView.as_view()),
+    path("scans/<int:pk>/risk", views.ScanRiskView.as_view()),
     path("scans/<int:pk>/confirm", views.ScanConfirmView.as_view()),
 ]
