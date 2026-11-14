@@ -7,13 +7,12 @@
 
 | 단계 | 조건 (하나라도) |
 | 위험 | 당일·하루 + 예상 잔여 5개 이상 / 당일·하루 + 예상 잔여가 남은 수량의 40% 이상 |
-| 주의 | 당일·하루 + 예상 잔여 2~4개 / 최근 5영업일 중 3일 이상 남음 |
+| 주의 | 당일·하루 + 예상 잔여 2~4개 / 최근 5영업일 중 3일 이상 남음 /
+|      | 2일+ + 이월 재고(예상 잔여)가 내일 추천 생산량의 50% 초과 |
 | 여유 | 그 외 |
-
-TODO: 2일+ 등급 이월 재고 조건은 내일 생산 추천(#24)이 생기면 연결
 """
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 from django.utils import timezone
 
@@ -26,6 +25,7 @@ DANGER_RATIO = 0.4  # 예상 잔여가 남은 수량의 N 이상이면 위험
 CAUTION_LEFT = 2  # 예상 잔여 2~4개면 주의
 REPEAT_WINDOW = 5  # 최근 N영업일
 REPEAT_MIN = 3  # 중 N일 이상 남으면 주의
+CARRYOVER_RATIO = 0.5  # 2일+ 이월 재고가 내일 추천량의 N 초과면 주의
 
 DANGER = "danger"
 CAUTION = "caution"
@@ -71,7 +71,9 @@ def expected_left(left: int, made: int, elapsed_h: float, remaining_h: float, k:
     return max(round(left - rate * remaining_h * k), 0)
 
 
-def classify(shelf_life: str, left: int, expected: int, repeat_days: int) -> Risk:
+def classify(shelf_life: str, left: int, expected: int, repeat_days: int,
+             tomorrow_rec: int | None = None) -> Risk:
+    """tomorrow_rec: 2일+ 품목의 내일 추천 생산량 (모르면 None → 이월 조건 건너뜀)"""
     if left <= 0:
         return Risk(SAFE, 0, "다 팔렸어요")
     perishable = shelf_life in PERISHABLE
@@ -81,6 +83,9 @@ def classify(shelf_life: str, left: int, expected: int, repeat_days: int) -> Ris
         return Risk(DANGER, expected, f"{label} · 마감 때 약 {expected}개 남을 것 같아요")
     if perishable and expected >= CAUTION_LEFT:
         return Risk(CAUTION, expected, f"{label} · 마감 때 약 {expected}개 남을 것 같아요")
+    if (shelf_life == Item.ShelfLife.DAY2 and tomorrow_rec is not None and expected > 0
+            and expected > tomorrow_rec * CARRYOVER_RATIO):
+        return Risk(CAUTION, expected, f"이월 재고 약 {expected}개가 내일 추천량({tomorrow_rec}개)의 절반을 넘어요")
     if repeat_days >= REPEAT_MIN:
         return Risk(CAUTION, expected, f"최근 {REPEAT_WINDOW}영업일 중 {repeat_days}일 남았어요")
     if not perishable:
@@ -122,6 +127,7 @@ def evaluate(store, at: datetime, items: list[Item], quantities: dict[int, int])
     made = made_qty(store.id, target, ids)
     repeat = repeat_left_days(store.id, target, ids)
     hours = store_hours(store, at)
+    tomorrow = tomorrow_recommended(store, target, items)
 
     result = {}
     for it in items:
@@ -130,8 +136,18 @@ def evaluate(store, at: datetime, items: list[Item], quantities: dict[int, int])
             exp = expected_left(left, made.get(it.id, 0), *hours)
         else:
             exp = left  # 영업시간을 모르면 판매 속도 없이 남은 수량 그대로
-        result[it.id] = classify(it.shelf_life, left, exp, repeat.get(it.id, 0))
+        result[it.id] = classify(it.shelf_life, left, exp, repeat.get(it.id, 0), tomorrow.get(it.id))
     return result
+
+
+def tomorrow_recommended(store, today: date, items: list[Item]) -> dict[int, int]:
+    """2일+ 품목의 내일 추천 생산량 (#24). 2일+ 품목이 없으면 계산하지 않음"""
+    if not any(it.shelf_life == Item.ShelfLife.DAY2 for it in items):
+        return {}
+    from dashboard.recommend import build_recommendation  # dashboard → scans.risk 순환 import 방지
+
+    rec = build_recommendation(store, today + timedelta(days=1))
+    return {r["item_id"]: r["recommended"] for r in rec["items"]}
 
 
 def summarize(risks: dict[int, Risk], quantities: dict[int, int]) -> dict:
