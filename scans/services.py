@@ -188,8 +188,10 @@ def confirm_scan(scan: ShelfScan, target_date: date, items: list[dict], purpose:
     if purpose:
         scan.purpose = purpose
     if scan.purpose == Purpose.OPEN:
-        from records.production import add_productions  # #17
-
+        try:
+            from records.production import add_productions  # #17 (A)
+        except ImportError:
+            raise AppError("PRODUCTION_NOT_READY", "오전 진열 기록은 아직 준비 중이에요", 501)
         add_productions(scan.store_id, target_date, "initial",
                         [{"item_id": i, "qty": q} for i, q in quantities.items()])
     else:
