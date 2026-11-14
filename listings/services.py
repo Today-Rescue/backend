@@ -6,12 +6,14 @@ from django.utils import timezone
 from common.exceptions import AppError
 from items.models import Item
 from records.models import DailyRecord
-from scans.models import ScanCount, ShelfScan
+from scans.models import RiskSnapshot, ScanCount, ShelfScan
+from scans.services import latest_risks
 
 from . import bundles, clients
 from .models import Bundle, BundleItem, CampaignItem, SaleCampaign
 
 DISCOUNT_RATES = (20, 30, 40, 50)
+RISK_TARGETS = {RiskSnapshot.Level.DANGER, RiskSnapshot.Level.CAUTION}
 
 
 def sale_price(price: int, rate: int) -> int:
@@ -56,15 +58,66 @@ def active_discount(store_id: int) -> SaleCampaign | None:
     ).first()
 
 
+def default_ends_at(store) -> datetime | None:
+    """세일 종료 기본값 = 오늘 마감 시각 (SL-04 '지금 ~ 마감'). 이미 지났거나 모르면 None"""
+    if store.close_time is None:
+        return None
+    now = timezone.localtime()
+    closes = timezone.make_aware(datetime.combine(now.date(), store.close_time))
+    return closes if closes > now else None
+
+
+def risk_item_ids(store_id: int) -> list[int]:
+    """오늘 마지막 재고 스캔의 위험·주의 품목 (MN-05 원터치 할인 대상)"""
+    risks = latest_risks(store_id, timezone.localdate())
+    if not risks:
+        raise AppError("NO_STOCK_SCAN", "먼저 매대를 찍어 남은 재고를 확인해 주세요")
+    ids = [i for i, r in risks.items() if r.level in RISK_TARGETS]
+    if not ids:
+        raise AppError("NO_RISK_ITEMS", "할인이 필요한 위험·주의 품목이 없어요")
+    return sorted(ids)
+
+
+def discount_options(store, rate: int) -> list[dict]:
+    """할인 화면(SL-02) 품목 체크리스트. 위험·주의는 기본 선택, 여유는 해제"""
+    risks = latest_risks(store.id, timezone.localdate())
+    items = list(Item.objects.filter(store=store, is_active=True).order_by("id"))
+    left = current_left_qty(store.id, [it.id for it in items])
+    rows = []
+    for it in items:
+        r = risks.get(it.id)
+        rows.append({
+            "item_id": it.id,
+            "name": it.name,
+            "image_url": it.image_url,
+            "price": it.price,
+            "sale_price": sale_price(it.price, rate),
+            "left_qty": left.get(it.id),
+            "level": r.level if r else None,
+            "reason": r.reason if r else None,
+            "default_selected": bool(r and r.level in RISK_TARGETS),
+        })
+    order = {"danger": 0, "caution": 1, "safe": 2, None: 3}
+    rows.sort(key=lambda x: order[x["level"]])
+    return rows
+
+
 @transaction.atomic
-def start_discount(store, rate: int, item_ids: list[int], ends_at: datetime | None) -> SaleCampaign:
-    """일괄 할인 시작 (SL-05). 가게당 진행 중인 일괄 할인은 1개"""
+def start_discount(store, rate: int, item_ids: list[int] | None, ends_at: datetime | None) -> SaleCampaign:
+    """일괄 할인 시작 (SL-05). 가게당 진행 중인 일괄 할인은 1개
+
+    item_ids가 없으면 원터치 할인 (MN-05): 마지막 재고 스캔의 위험·주의 품목
+    ends_at이 없으면 오늘 마감 시각
+    """
     if active_discount(store.id):
         raise AppError("DISCOUNT_ALREADY_ACTIVE", "이미 진행 중인 할인이 있어요")
+    if not item_ids:
+        item_ids = risk_item_ids(store.id)
     items = _store_items(store.id, item_ids)
     now = timezone.now()
     if ends_at and ends_at <= now:
         raise AppError("INVALID_END_TIME", "종료 시각은 지금 이후여야 해요")
+    ends_at = ends_at or default_ends_at(store)
 
     campaign = SaleCampaign.objects.create(
         store=store, type=SaleCampaign.Type.DISCOUNT, discount_rate=rate,
