@@ -6,12 +6,14 @@ from django.utils import timezone
 from common.exceptions import AppError
 from items.models import Item
 from records.models import DailyRecord
-from scans.models import ScanCount
+from scans.models import RiskSnapshot, ScanCount, ShelfScan
+from scans.services import latest_risks
 
 from . import bundles, clients
-from .models import Bundle, BundleItem, CampaignItem, SaleCampaign
+from .models import Bundle, BundleItem, CampaignItem, SaleCampaign, SalesEvent
 
 DISCOUNT_RATES = (20, 30, 40, 50)
+RISK_TARGETS = {RiskSnapshot.Level.DANGER, RiskSnapshot.Level.CAUTION}
 
 
 def sale_price(price: int, rate: int) -> int:
@@ -20,11 +22,15 @@ def sale_price(price: int, rate: int) -> int:
 
 
 def current_left_qty(store_id: int, item_ids: list[int]) -> dict[int, int]:
-    """품목별 지금 남은 수량. 오늘 마지막 확정 스캔 → 없으면 오늘 일일 기록의 남은 수량"""
+    """품목별 지금 남은 수량. 오늘 마지막 확정 재고 스캔(close) → 없으면 오늘 일일 기록의 남은 수량
+
+    오전 진열 스캔(open)은 만든 수량이라 제외
+    """
     today = timezone.localdate()
     result: dict[int, int] = {}
     counts = (
         ScanCount.objects.filter(scan__store_id=store_id, item_id__in=item_ids,
+                                 scan__purpose=ShelfScan.Purpose.CLOSE,
                                  confirmed_qty__isnull=False, scan__updated_at__date=today)
         .order_by("scan__updated_at")
     )
@@ -52,15 +58,66 @@ def active_discount(store_id: int) -> SaleCampaign | None:
     ).first()
 
 
+def default_ends_at(store) -> datetime | None:
+    """세일 종료 기본값 = 오늘 마감 시각 (SL-04 '지금 ~ 마감'). 이미 지났거나 모르면 None"""
+    if store.close_time is None:
+        return None
+    now = timezone.localtime()
+    closes = timezone.make_aware(datetime.combine(now.date(), store.close_time))
+    return closes if closes > now else None
+
+
+def risk_item_ids(store_id: int) -> list[int]:
+    """오늘 마지막 재고 스캔의 위험·주의 품목 (MN-05 원터치 할인 대상)"""
+    risks = latest_risks(store_id, timezone.localdate())
+    if not risks:
+        raise AppError("NO_STOCK_SCAN", "먼저 매대를 찍어 남은 재고를 확인해 주세요")
+    ids = [i for i, r in risks.items() if r.level in RISK_TARGETS]
+    if not ids:
+        raise AppError("NO_RISK_ITEMS", "할인이 필요한 위험·주의 품목이 없어요")
+    return sorted(ids)
+
+
+def discount_options(store, rate: int) -> list[dict]:
+    """할인 화면(SL-02) 품목 체크리스트. 위험·주의는 기본 선택, 여유는 해제"""
+    risks = latest_risks(store.id, timezone.localdate())
+    items = list(Item.objects.filter(store=store, is_active=True).order_by("id"))
+    left = current_left_qty(store.id, [it.id for it in items])
+    rows = []
+    for it in items:
+        r = risks.get(it.id)
+        rows.append({
+            "item_id": it.id,
+            "name": it.name,
+            "image_url": it.image_url,
+            "price": it.price,
+            "sale_price": sale_price(it.price, rate),
+            "left_qty": left.get(it.id),
+            "level": r.level if r else None,
+            "reason": r.reason if r else None,
+            "default_selected": bool(r and r.level in RISK_TARGETS),
+        })
+    order = {"danger": 0, "caution": 1, "safe": 2, None: 3}
+    rows.sort(key=lambda x: order[x["level"]])
+    return rows
+
+
 @transaction.atomic
-def start_discount(store, rate: int, item_ids: list[int], ends_at: datetime | None) -> SaleCampaign:
-    """일괄 할인 시작 (SL-05). 가게당 진행 중인 일괄 할인은 1개"""
+def start_discount(store, rate: int, item_ids: list[int] | None, ends_at: datetime | None) -> SaleCampaign:
+    """일괄 할인 시작 (SL-05). 가게당 진행 중인 일괄 할인은 1개
+
+    item_ids가 없으면 원터치 할인 (MN-05): 마지막 재고 스캔의 위험·주의 품목
+    ends_at이 없으면 오늘 마감 시각
+    """
     if active_discount(store.id):
         raise AppError("DISCOUNT_ALREADY_ACTIVE", "이미 진행 중인 할인이 있어요")
+    if not item_ids:
+        item_ids = risk_item_ids(store.id)
     items = _store_items(store.id, item_ids)
     now = timezone.now()
     if ends_at and ends_at <= now:
         raise AppError("INVALID_END_TIME", "종료 시각은 지금 이후여야 해요")
+    ends_at = ends_at or default_ends_at(store)
 
     campaign = SaleCampaign.objects.create(
         store=store, type=SaleCampaign.Type.DISCOUNT, discount_rate=rate,
@@ -248,3 +305,172 @@ def start_bundle(store, name: str, price: int, rows: list[dict], ends_at: dateti
     bundle = Bundle.objects.create(campaign=campaign, name=name, price=price, packs=packs)
     BundleItem.objects.bulk_create([BundleItem(bundle=bundle, item=items[i], per_pack=n) for i, n in per_pack.items()])
     return campaign
+
+
+# ── 판매 기록 (#21) ───────────────────────────────────
+def _apply_sale(store_id: int, sale_date, item_id: int, qty: int) -> None:
+    """records.services.apply_sale (A) 호출. 아직 없으면 준비 중 에러 → 판매 기록도 취소"""
+    from records import services as records_services
+
+    apply_sale = getattr(records_services, "apply_sale", None)
+    if apply_sale is None:
+        raise AppError("APPLY_SALE_NOT_READY", "남은 수량 차감은 아직 준비 중이에요", 501)
+    apply_sale(store_id, sale_date, item_id, qty)
+
+
+def sold_by_item(campaign: SaleCampaign) -> dict[int | None, int]:
+    """{item_id: 판매 수}. 세트 판매(팩 수)는 None 키"""
+    result: dict[int | None, int] = {}
+    for item_id, qty in campaign.sales.values_list("item_id", "quantity"):
+        result[item_id] = result.get(item_id, 0) + qty
+    return result
+
+
+@transaction.atomic
+def record_sales(campaign: SaleCampaign, channel: str, items: list[dict] | None, packs: int | None) -> list[SalesEvent]:
+    """판매 확정 (POST /campaigns/{id}/sales)
+
+    - 일괄 할인: items=[{item_id, quantity}] → 품목별 apply_sale
+    - 세트: packs → 구성 품목마다 팩 수 × 팩당 개수만큼 apply_sale
+    세일 시작 때 남은 수량(start_qty)이나 팩 수보다 많이 팔 수 없음
+    """
+    campaign = SaleCampaign.objects.select_for_update().get(pk=campaign.pk)
+    _ensure_active(campaign)
+    sale_date = timezone.localtime(campaign.started_at).date()
+    sold = sold_by_item(campaign)
+    events = []
+
+    if campaign.type == SaleCampaign.Type.BUNDLE:
+        if not packs:
+            raise AppError("PACKS_REQUIRED", "판매한 팩 수를 보내 주세요")
+        bundle = campaign.bundle
+        if sold.get(None, 0) + packs > bundle.packs:
+            raise AppError("OVER_STOCK", f"남은 팩은 {bundle.packs - sold.get(None, 0)}팩이에요")
+        events.append(SalesEvent.objects.create(campaign=campaign, quantity=packs, unit_price=bundle.price,
+                                                channel=channel))
+        for bi in bundle.items.all():
+            _apply_sale(campaign.store_id, sale_date, bi.item_id, packs * bi.per_pack)
+        return events
+
+    if not items:
+        raise AppError("ITEMS_REQUIRED", "판매한 품목을 보내 주세요")
+    targets = {ci.item_id: ci for ci in campaign.items.select_related("item")}
+    seen = set()
+    for row in items:
+        item_id, qty = row["item_id"], row["quantity"]
+        if item_id in seen:
+            raise AppError("DUPLICATE_ITEM", "같은 품목이 두 번 들어 있어요")
+        seen.add(item_id)
+        ci = targets.get(item_id)
+        if ci is None:
+            raise AppError("ITEM_NOT_IN_CAMPAIGN", "할인 대상 품목이 아니에요")
+        if ci.start_qty is not None and sold.get(item_id, 0) + qty > ci.start_qty:
+            raise AppError("OVER_STOCK", f"{ci.item.name}은(는) {ci.start_qty - sold.get(item_id, 0)}개 남았어요")
+        events.append(SalesEvent.objects.create(campaign=campaign, item_id=item_id, quantity=qty,
+                                                unit_price=ci.sale_price, channel=channel))
+        _apply_sale(campaign.store_id, sale_date, item_id, qty)
+    return events
+
+
+def sale_response(e: SalesEvent) -> dict:
+    return {
+        "id": e.id,
+        "item_id": e.item_id,
+        "name": e.item.name if e.item_id else e.campaign.bundle.name,
+        "quantity": e.quantity,
+        "unit": "item" if e.item_id else "pack",
+        "unit_price": e.unit_price,
+        "amount": e.unit_price * e.quantity,
+        "channel": e.channel,
+        "sold_at": timezone.localtime(e.sold_at).isoformat(timespec="minutes"),
+    }
+
+
+# ── 마감 세일 현황 (#22) ──────────────────────────────
+SLOW_MIN_MINUTES = 30  # 세일 시작 후 이만큼 지나야 '느림' 판단
+SLOW_RATIO = 0.5  # 판매율이 시간 진행률의 절반보다 낮으면 느림
+
+
+def _minutes(start, end) -> int:
+    return max(int((end - start).total_seconds() // 60), 0)
+
+
+def _latest_today(store_id: int, type_: str) -> SaleCampaign | None:
+    """오늘 해당 유형의 세일. 진행 중인 것 우선, 없으면 가장 최근"""
+    qs = SaleCampaign.objects.filter(store_id=store_id, type=type_,
+                                     started_at__date=timezone.localdate()).order_by("-started_at")
+    return qs.filter(status=SaleCampaign.Status.ACTIVE).first() or qs.first()
+
+
+def _channel_counts(campaign: SaleCampaign) -> dict[str, int]:
+    counts = {c: 0 for c in SalesEvent.Channel.values}
+    for ch, qty in campaign.sales.values_list("channel", "quantity"):
+        counts[ch] += qty
+    return counts
+
+
+def _time_ratio(campaign: SaleCampaign, now) -> float | None:
+    """세일 시간 중 지난 비율. 종료 예정이 없으면 None"""
+    if not campaign.ends_at:
+        return None
+    total = _minutes(campaign.started_at, campaign.ends_at)
+    return min(_minutes(campaign.started_at, now) / total, 1.0) if total else 1.0
+
+
+def _discount_live(c: SaleCampaign, now) -> dict:
+    sold = sold_by_item(c)
+    elapsed = _minutes(c.started_at, now)
+    ratio = _time_ratio(c, now)
+    items, slow_ids = [], []
+    for ci in c.items.select_related("item").order_by("item_id"):
+        n = sold.get(ci.item_id, 0)
+        left = max(ci.start_qty - n, 0) if ci.start_qty is not None else None
+        slow = (
+            c.status == SaleCampaign.Status.ACTIVE and ratio is not None and elapsed >= SLOW_MIN_MINUTES
+            and bool(ci.start_qty) and left > 0 and n / ci.start_qty < ratio * SLOW_RATIO
+        )
+        if slow:
+            slow_ids.append(ci.item_id)
+        items.append({
+            "item_id": ci.item_id, "name": ci.item.name, "image_url": ci.item.image_url,
+            "sale_price": ci.sale_price, "start_qty": ci.start_qty, "sold_qty": n, "left_qty": left,
+            "sold_out": left == 0, "slow": slow,
+        })
+    target = sum(ci.start_qty or 0 for ci in c.items.all())
+    total_sold = sum(v for k, v in sold.items() if k is not None)
+    suggestion = None
+    if slow_ids and c.discount_rate < max(DISCOUNT_RATES):
+        next_rate = min(r for r in DISCOUNT_RATES if r > c.discount_rate)
+        suggestion = {"type": "raise_rate", "item_ids": slow_ids, "next_rate": next_rate}  # LV-04
+    return {
+        "campaign_id": c.id, "status": c.status, "discount_rate": c.discount_rate,
+        "target_qty": target, "sold_qty": total_sold,
+        "progress": round(total_sold / target, 2) if target else 0.0,
+        "channels": _channel_counts(c),
+        "items": items,
+        "suggestion": suggestion,
+    }
+
+
+def _bundle_live(c: SaleCampaign) -> dict:
+    b = c.bundle
+    sold = sold_by_item(c).get(None, 0)
+    return {
+        "campaign_id": c.id, "status": c.status, "name": b.name, "price": b.price,
+        "packs": b.packs, "sold_packs": sold, "left_packs": max(b.packs - sold, 0),
+        "progress": round(sold / b.packs, 2) if b.packs else 0.0,
+        "channels": _channel_counts(c),
+    }
+
+
+def live_status(store) -> dict:
+    """마감 세일 현황 (LV-01~04). 오늘 일괄 할인·세트 각각 최신 1개"""
+    now = timezone.now()
+    discount = _latest_today(store.id, SaleCampaign.Type.DISCOUNT)
+    bundle = _latest_today(store.id, SaleCampaign.Type.BUNDLE)
+    closes = default_ends_at(store)
+    return {
+        "minutes_to_close": _minutes(now, closes) if closes else None,
+        "discount": _discount_live(discount, now) if discount else None,
+        "bundle": _bundle_live(bundle) if bundle else None,
+    }
