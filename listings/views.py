@@ -141,3 +141,16 @@ class CampaignSalesView(APIView):
         d = s.validated_data
         events = services.record_sales(campaign, d["channel"], d.get("items"), d.get("packs"))
         return Response([services.sale_response(e) for e in events], status=201)
+
+
+class StoreLiveView(APIView):
+    """GET /stores/{id}/campaigns/live  마감 세일 현황 (LV-01~04)
+
+    - discount: 진행률, 채널별 판매 수, 품목별 세일 전 → 현재 수량, 느린 품목과 할인율 올리기 제안
+    - bundle: 판매 팩 / 전체 팩
+    오늘 세일이 없으면 각각 null
+    """
+
+    def get(self, request, store_id):
+        store = get_object_or_404(Store, pk=store_id)
+        return Response(services.live_status(store))
