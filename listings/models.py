@@ -77,3 +77,25 @@ class BundleItem(models.Model):
 
     class Meta:
         unique_together = ("bundle", "item")
+
+
+class ActionLog(models.Model):
+    """마감 행동 기록 (RC-04 타임라인). listings.actions.log_action으로 남겨요"""
+
+    class Type(models.TextChoices):
+        SCAN = "scan"  # 스캔 확정 (최초 진열 / 재고 기록)
+        SALE_START = "sale_start"  # 일괄 할인 시작
+        BUNDLE_START = "bundle_start"  # 세트 등록
+        SALE_UPDATE = "sale_update"  # 할인율·품목 변경
+        SALE_STOP = "sale_stop"  # 세일 중지·종료
+        CLOSE = "close"  # 마감 기록 저장
+
+    store = models.ForeignKey("stores.Store", on_delete=models.CASCADE, related_name="actions")
+    date = models.DateField()  # 영업일
+    type = models.CharField(max_length=20, choices=Type.choices)
+    message = models.CharField(max_length=100)  # 화면에 보여줄 한 줄
+    detail = models.JSONField(default=dict, blank=True)  # 예: {"campaign_id": 7, "from": 30, "to": 40}
+    occurred_at = models.DateTimeField()
+
+    class Meta:
+        indexes = [models.Index(fields=["store", "date"])]

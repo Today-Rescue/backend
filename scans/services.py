@@ -9,6 +9,8 @@ from PIL import Image, ImageStat
 
 from common.exceptions import AppError
 from items.models import Item
+from listings.actions import log_action
+from listings.models import ActionLog
 from records.services import update_left_qty
 from uploads.services import resize_image, save_bytes
 
@@ -248,6 +250,15 @@ def confirm_scan(scan: ShelfScan, target_date: date, items: list[dict], purpose:
     else:
         update_left_qty(scan.store_id, target_date, quantities)
         save_risks(scan, quantities)
+
+    total = sum(quantities.values())
+    if scan.purpose == Purpose.OPEN:
+        message = f"최초 진열 기록 · 오늘 만든 빵 {total}개"
+    else:
+        flagged = scan.risks.filter(level__in=[RiskSnapshot.Level.DANGER, RiskSnapshot.Level.CAUTION]).count()
+        message = f"재고 기록 · 남은 빵 {total}개" + (f", 위험·주의 {flagged}종" if flagged else "")
+    log_action(scan.store_id, ActionLog.Type.SCAN, message,
+               {"scan_id": scan.id, "purpose": scan.purpose, "total": total}, date=target_date)
     scan.status = Status.CONFIRMED
     scan.confirmed_result = {"date": target_date.isoformat()}
     scan.save()

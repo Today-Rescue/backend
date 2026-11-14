@@ -7,6 +7,8 @@ from rest_framework.views import APIView
 
 from common.exceptions import AppError
 from items.models import Item
+from listings.actions import log_action
+from listings.models import ActionLog
 
 from .models import CloseRecord, DailyRecord
 from .production import _check_store
@@ -114,7 +116,11 @@ def save_closing(store_id: int, target, rows: list[dict]) -> dict:
             rec.sold_out = True
             rec.save(update_fields=["sold_out"])
 
-    return get_closing(store_id, target)
+    result = get_closing(store_id, target)
+    log_action(store_id, ActionLog.Type.CLOSE,  # RC-04 타임라인 (B)
+               f"마감 기록 저장 · 폐기 {result['disposed_total']}개, 내일 판매 {result['carryover_total']}개",
+               {"disposed": result["disposed_total"], "carryover": result["carryover_total"]}, date=target)
+    return result
 
 
 # ── API ─────────────────────────────────────────
