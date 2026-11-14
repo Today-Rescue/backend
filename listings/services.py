@@ -6,7 +6,7 @@ from django.utils import timezone
 from common.exceptions import AppError
 from items.models import Item
 from records.models import DailyRecord
-from scans.models import ScanCount
+from scans.models import ScanCount, ShelfScan
 
 from . import bundles, clients
 from .models import Bundle, BundleItem, CampaignItem, SaleCampaign
@@ -20,11 +20,15 @@ def sale_price(price: int, rate: int) -> int:
 
 
 def current_left_qty(store_id: int, item_ids: list[int]) -> dict[int, int]:
-    """품목별 지금 남은 수량. 오늘 마지막 확정 스캔 → 없으면 오늘 일일 기록의 남은 수량"""
+    """품목별 지금 남은 수량. 오늘 마지막 확정 재고 스캔(close) → 없으면 오늘 일일 기록의 남은 수량
+
+    오전 진열 스캔(open)은 만든 수량이라 제외
+    """
     today = timezone.localdate()
     result: dict[int, int] = {}
     counts = (
         ScanCount.objects.filter(scan__store_id=store_id, item_id__in=item_ids,
+                                 scan__purpose=ShelfScan.Purpose.CLOSE,
                                  confirmed_qty__isnull=False, scan__updated_at__date=today)
         .order_by("scan__updated_at")
     )

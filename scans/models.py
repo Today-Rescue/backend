@@ -13,7 +13,12 @@ class ShelfScan(TimeStampedModel):
         TOO_DARK = "too_dark"  # 사진 어두움 (CP-07)
         CONFIRMED = "confirmed"  # 수량 확정 완료
 
+    class Purpose(models.TextChoices):
+        OPEN = "open"  # 최초 진열 → 오늘 만든 수량 (PR-02)
+        CLOSE = "close"  # 재고 기록 → 남은 수량 (SR)
+
     store = models.ForeignKey("stores.Store", on_delete=models.CASCADE)
+    purpose = models.CharField(max_length=10, choices=Purpose.choices, default=Purpose.CLOSE)
     image_url = models.CharField(max_length=300)
     status = models.CharField(max_length=20, choices=Status.choices, default=Status.PENDING)
     model_name = models.CharField(max_length=50, blank=True)  # 인식에 쓴 AI 모델

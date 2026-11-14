@@ -1,5 +1,7 @@
 from rest_framework import serializers
 
+from .models import ShelfScan
+
 
 class ConfirmItemSerializer(serializers.Serializer):
     item_id = serializers.IntegerField()
@@ -8,4 +10,5 @@ class ConfirmItemSerializer(serializers.Serializer):
 
 class ConfirmSerializer(serializers.Serializer):
     date = serializers.DateField()
+    purpose = serializers.ChoiceField(choices=ShelfScan.Purpose.choices, required=False)
     items = ConfirmItemSerializer(many=True, allow_empty=False)
