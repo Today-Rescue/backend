@@ -384,3 +384,93 @@ def sale_response(e: SalesEvent) -> dict:
         "channel": e.channel,
         "sold_at": timezone.localtime(e.sold_at).isoformat(timespec="minutes"),
     }
+
+
+# ── 마감 세일 현황 (#22) ──────────────────────────────
+SLOW_MIN_MINUTES = 30  # 세일 시작 후 이만큼 지나야 '느림' 판단
+SLOW_RATIO = 0.5  # 판매율이 시간 진행률의 절반보다 낮으면 느림
+
+
+def _minutes(start, end) -> int:
+    return max(int((end - start).total_seconds() // 60), 0)
+
+
+def _latest_today(store_id: int, type_: str) -> SaleCampaign | None:
+    """오늘 해당 유형의 세일. 진행 중인 것 우선, 없으면 가장 최근"""
+    qs = SaleCampaign.objects.filter(store_id=store_id, type=type_,
+                                     started_at__date=timezone.localdate()).order_by("-started_at")
+    return qs.filter(status=SaleCampaign.Status.ACTIVE).first() or qs.first()
+
+
+def _channel_counts(campaign: SaleCampaign) -> dict[str, int]:
+    counts = {c: 0 for c in SalesEvent.Channel.values}
+    for ch, qty in campaign.sales.values_list("channel", "quantity"):
+        counts[ch] += qty
+    return counts
+
+
+def _time_ratio(campaign: SaleCampaign, now) -> float | None:
+    """세일 시간 중 지난 비율. 종료 예정이 없으면 None"""
+    if not campaign.ends_at:
+        return None
+    total = _minutes(campaign.started_at, campaign.ends_at)
+    return min(_minutes(campaign.started_at, now) / total, 1.0) if total else 1.0
+
+
+def _discount_live(c: SaleCampaign, now) -> dict:
+    sold = sold_by_item(c)
+    elapsed = _minutes(c.started_at, now)
+    ratio = _time_ratio(c, now)
+    items, slow_ids = [], []
+    for ci in c.items.select_related("item").order_by("item_id"):
+        n = sold.get(ci.item_id, 0)
+        left = max(ci.start_qty - n, 0) if ci.start_qty is not None else None
+        slow = (
+            c.status == SaleCampaign.Status.ACTIVE and ratio is not None and elapsed >= SLOW_MIN_MINUTES
+            and bool(ci.start_qty) and left > 0 and n / ci.start_qty < ratio * SLOW_RATIO
+        )
+        if slow:
+            slow_ids.append(ci.item_id)
+        items.append({
+            "item_id": ci.item_id, "name": ci.item.name, "image_url": ci.item.image_url,
+            "sale_price": ci.sale_price, "start_qty": ci.start_qty, "sold_qty": n, "left_qty": left,
+            "sold_out": left == 0, "slow": slow,
+        })
+    target = sum(ci.start_qty or 0 for ci in c.items.all())
+    total_sold = sum(v for k, v in sold.items() if k is not None)
+    suggestion = None
+    if slow_ids and c.discount_rate < max(DISCOUNT_RATES):
+        next_rate = min(r for r in DISCOUNT_RATES if r > c.discount_rate)
+        suggestion = {"type": "raise_rate", "item_ids": slow_ids, "next_rate": next_rate}  # LV-04
+    return {
+        "campaign_id": c.id, "status": c.status, "discount_rate": c.discount_rate,
+        "target_qty": target, "sold_qty": total_sold,
+        "progress": round(total_sold / target, 2) if target else 0.0,
+        "channels": _channel_counts(c),
+        "items": items,
+        "suggestion": suggestion,
+    }
+
+
+def _bundle_live(c: SaleCampaign) -> dict:
+    b = c.bundle
+    sold = sold_by_item(c).get(None, 0)
+    return {
+        "campaign_id": c.id, "status": c.status, "name": b.name, "price": b.price,
+        "packs": b.packs, "sold_packs": sold, "left_packs": max(b.packs - sold, 0),
+        "progress": round(sold / b.packs, 2) if b.packs else 0.0,
+        "channels": _channel_counts(c),
+    }
+
+
+def live_status(store) -> dict:
+    """마감 세일 현황 (LV-01~04). 오늘 일괄 할인·세트 각각 최신 1개"""
+    now = timezone.now()
+    discount = _latest_today(store.id, SaleCampaign.Type.DISCOUNT)
+    bundle = _latest_today(store.id, SaleCampaign.Type.BUNDLE)
+    closes = default_ends_at(store)
+    return {
+        "minutes_to_close": _minutes(now, closes) if closes else None,
+        "discount": _discount_live(discount, now) if discount else None,
+        "bundle": _bundle_live(bundle) if bundle else None,
+    }
