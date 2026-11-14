@@ -10,4 +10,5 @@ urlpatterns = [
     path("stores/<int:store_id>/bundles/calculate", views.BundleCalculateView.as_view()),
     path("campaigns/<int:pk>", views.CampaignDetailView.as_view()),
     path("campaigns/<int:pk>/status", views.CampaignStatusView.as_view()),
+    path("campaigns/<int:pk>/sales", views.CampaignSalesView.as_view()),
 ]

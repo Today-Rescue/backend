@@ -17,6 +17,7 @@ from .serializers import (
     CampaignStatusSerializer,
     DiscountCreateSerializer,
     DiscountUpdateSerializer,
+    SalesCreateSerializer,
 )
 
 
@@ -119,3 +120,24 @@ class StoreBundleView(APIView):
         d = s.validated_data
         campaign = services.start_bundle(store, d["name"], d["price"], d["items"], d.get("ends_at"))
         return Response(services.campaign_response(campaign), status=201)
+
+
+class CampaignSalesView(APIView):
+    """GET /campaigns/{id}/sales   판매 내역 (최근 순)
+    POST /campaigns/{id}/sales  판매 확정 → 남은 수량 차감
+      일괄 할인: {channel: daangn|store, items:[{item_id, quantity}]}
+      세트: {channel, packs}
+    """
+
+    def get(self, request, pk):
+        campaign = get_object_or_404(SaleCampaign, pk=pk)
+        events = campaign.sales.select_related("item", "campaign__bundle").order_by("-sold_at", "-id")
+        return Response([services.sale_response(e) for e in events])
+
+    def post(self, request, pk):
+        campaign = get_object_or_404(SaleCampaign, pk=pk)
+        s = SalesCreateSerializer(data=request.data)
+        s.is_valid(raise_exception=True)
+        d = s.validated_data
+        events = services.record_sales(campaign, d["channel"], d.get("items"), d.get("packs"))
+        return Response([services.sale_response(e) for e in events], status=201)

@@ -51,6 +51,25 @@ class Bundle(models.Model):
     packs = models.IntegerField()  # 만든 팩 수
 
 
+class SalesEvent(models.Model):
+    """세일 중 판매 한 건 (LV-01, RC-03, DB-02)
+
+    - 일괄 할인: item + quantity(개)
+    - 세트: item 없음, quantity = 팩 수
+    """
+
+    class Channel(models.TextChoices):
+        DAANGN = "daangn"  # 당근 주문
+        STORE = "store"  # 매장 결제
+
+    campaign = models.ForeignKey(SaleCampaign, on_delete=models.CASCADE, related_name="sales")
+    item = models.ForeignKey("items.Item", on_delete=models.PROTECT, null=True, blank=True)
+    quantity = models.IntegerField()
+    unit_price = models.IntegerField()  # 판매가 (할인가 또는 팩 가격)
+    channel = models.CharField(max_length=20, choices=Channel.choices)
+    sold_at = models.DateTimeField(auto_now_add=True)
+
+
 class BundleItem(models.Model):
     bundle = models.ForeignKey(Bundle, on_delete=models.CASCADE, related_name="items")
     item = models.ForeignKey("items.Item", on_delete=models.PROTECT)

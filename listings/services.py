@@ -10,7 +10,7 @@ from scans.models import RiskSnapshot, ScanCount, ShelfScan
 from scans.services import latest_risks
 
 from . import bundles, clients
-from .models import Bundle, BundleItem, CampaignItem, SaleCampaign
+from .models import Bundle, BundleItem, CampaignItem, SaleCampaign, SalesEvent
 
 DISCOUNT_RATES = (20, 30, 40, 50)
 RISK_TARGETS = {RiskSnapshot.Level.DANGER, RiskSnapshot.Level.CAUTION}
@@ -305,3 +305,82 @@ def start_bundle(store, name: str, price: int, rows: list[dict], ends_at: dateti
     bundle = Bundle.objects.create(campaign=campaign, name=name, price=price, packs=packs)
     BundleItem.objects.bulk_create([BundleItem(bundle=bundle, item=items[i], per_pack=n) for i, n in per_pack.items()])
     return campaign
+
+
+# ── 판매 기록 (#21) ───────────────────────────────────
+def _apply_sale(store_id: int, sale_date, item_id: int, qty: int) -> None:
+    """records.services.apply_sale (A) 호출. 아직 없으면 준비 중 에러 → 판매 기록도 취소"""
+    from records import services as records_services
+
+    apply_sale = getattr(records_services, "apply_sale", None)
+    if apply_sale is None:
+        raise AppError("APPLY_SALE_NOT_READY", "남은 수량 차감은 아직 준비 중이에요", 501)
+    apply_sale(store_id, sale_date, item_id, qty)
+
+
+def sold_by_item(campaign: SaleCampaign) -> dict[int | None, int]:
+    """{item_id: 판매 수}. 세트 판매(팩 수)는 None 키"""
+    result: dict[int | None, int] = {}
+    for item_id, qty in campaign.sales.values_list("item_id", "quantity"):
+        result[item_id] = result.get(item_id, 0) + qty
+    return result
+
+
+@transaction.atomic
+def record_sales(campaign: SaleCampaign, channel: str, items: list[dict] | None, packs: int | None) -> list[SalesEvent]:
+    """판매 확정 (POST /campaigns/{id}/sales)
+
+    - 일괄 할인: items=[{item_id, quantity}] → 품목별 apply_sale
+    - 세트: packs → 구성 품목마다 팩 수 × 팩당 개수만큼 apply_sale
+    세일 시작 때 남은 수량(start_qty)이나 팩 수보다 많이 팔 수 없음
+    """
+    campaign = SaleCampaign.objects.select_for_update().get(pk=campaign.pk)
+    _ensure_active(campaign)
+    sale_date = timezone.localtime(campaign.started_at).date()
+    sold = sold_by_item(campaign)
+    events = []
+
+    if campaign.type == SaleCampaign.Type.BUNDLE:
+        if not packs:
+            raise AppError("PACKS_REQUIRED", "판매한 팩 수를 보내 주세요")
+        bundle = campaign.bundle
+        if sold.get(None, 0) + packs > bundle.packs:
+            raise AppError("OVER_STOCK", f"남은 팩은 {bundle.packs - sold.get(None, 0)}팩이에요")
+        events.append(SalesEvent.objects.create(campaign=campaign, quantity=packs, unit_price=bundle.price,
+                                                channel=channel))
+        for bi in bundle.items.all():
+            _apply_sale(campaign.store_id, sale_date, bi.item_id, packs * bi.per_pack)
+        return events
+
+    if not items:
+        raise AppError("ITEMS_REQUIRED", "판매한 품목을 보내 주세요")
+    targets = {ci.item_id: ci for ci in campaign.items.select_related("item")}
+    seen = set()
+    for row in items:
+        item_id, qty = row["item_id"], row["quantity"]
+        if item_id in seen:
+            raise AppError("DUPLICATE_ITEM", "같은 품목이 두 번 들어 있어요")
+        seen.add(item_id)
+        ci = targets.get(item_id)
+        if ci is None:
+            raise AppError("ITEM_NOT_IN_CAMPAIGN", "할인 대상 품목이 아니에요")
+        if ci.start_qty is not None and sold.get(item_id, 0) + qty > ci.start_qty:
+            raise AppError("OVER_STOCK", f"{ci.item.name}은(는) {ci.start_qty - sold.get(item_id, 0)}개 남았어요")
+        events.append(SalesEvent.objects.create(campaign=campaign, item_id=item_id, quantity=qty,
+                                                unit_price=ci.sale_price, channel=channel))
+        _apply_sale(campaign.store_id, sale_date, item_id, qty)
+    return events
+
+
+def sale_response(e: SalesEvent) -> dict:
+    return {
+        "id": e.id,
+        "item_id": e.item_id,
+        "name": e.item.name if e.item_id else e.campaign.bundle.name,
+        "quantity": e.quantity,
+        "unit": "item" if e.item_id else "pack",
+        "unit_price": e.unit_price,
+        "amount": e.unit_price * e.quantity,
+        "channel": e.channel,
+        "sold_at": timezone.localtime(e.sold_at).isoformat(timespec="minutes"),
+    }

@@ -38,3 +38,16 @@ class BundleCreateSerializer(serializers.Serializer):
 
 class CampaignStatusSerializer(serializers.Serializer):
     status = serializers.ChoiceField(choices=["stopped", "ended"])
+
+
+class SaleItemSerializer(serializers.Serializer):
+    item_id = serializers.IntegerField()
+    quantity = serializers.IntegerField(min_value=1)
+
+
+class SalesCreateSerializer(serializers.Serializer):
+    """일괄 할인은 items, 세트는 packs"""
+
+    channel = serializers.ChoiceField(choices=["daangn", "store"])
+    items = SaleItemSerializer(many=True, required=False)
+    packs = serializers.IntegerField(min_value=1, required=False)
