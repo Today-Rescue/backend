@@ -1,6 +1,6 @@
 from datetime import date
 
-from records.services import recent_weekday_avg
+from records.services import recent_weekday_avg, weekly_made_totals
 from weather.services import get_weather, is_holiday
 
 
@@ -17,5 +17,5 @@ def build_home(store, target: date) -> dict:
         "weather": weather,  # None → 프론트에서 "날씨 정보 없음"
         "is_holiday": is_holiday(target),
         "recent_avg": recent_weekday_avg(store.id, target),
-        "weekly_made": [],  # TODO(A)
+        "weekly_made": weekly_made_totals(store.id, target),
     }

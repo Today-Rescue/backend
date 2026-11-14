@@ -1,31 +1,39 @@
 from rest_framework import serializers
 
-from .models import Listing, ListingItem
+from .services import DISCOUNT_RATES
 
 
-class ListingItemSerializer(serializers.ModelSerializer):
+class DiscountCreateSerializer(serializers.Serializer):
+    discount_rate = serializers.ChoiceField(choices=DISCOUNT_RATES, default=30)
+    item_ids = serializers.ListField(child=serializers.IntegerField(), allow_empty=False)
+    ends_at = serializers.DateTimeField(required=False, allow_null=True)
+
+
+class DiscountUpdateSerializer(serializers.Serializer):
+    discount_rate = serializers.ChoiceField(choices=DISCOUNT_RATES, required=False)
+    item_ids = serializers.ListField(child=serializers.IntegerField(), allow_empty=False, required=False)
+
+
+class BundleRecommendSerializer(serializers.Serializer):
+    item_ids = serializers.ListField(child=serializers.IntegerField(), required=False, allow_empty=True)
+
+
+class BundleItemSerializer(serializers.Serializer):
     item_id = serializers.IntegerField()
-    name = serializers.CharField(source="item.name", read_only=True)
-
-    class Meta:
-        model = ListingItem
-        fields = ["item_id", "name", "qty"]
+    per_pack = serializers.IntegerField(min_value=1)
+    qty = serializers.IntegerField(min_value=0, required=False)  # 없으면 서버가 지금 남은 수량 사용
 
 
-class ListingSerializer(serializers.ModelSerializer):
-    items = ListingItemSerializer(many=True)
-
-    class Meta:
-        model = Listing
-        fields = [
-            "id", "store_id", "type", "partner_name", "partner_contact",
-            "pickup_date", "pickup_start", "pickup_end", "bundle_price",
-            "status", "memo", "items", "created_at",
-        ]
-        read_only_fields = ["store_id", "status", "created_at"]
-
-    # TODO(B): create() 에서 items 중첩 저장
+class BundleCalculateSerializer(serializers.Serializer):
+    items = BundleItemSerializer(many=True, allow_empty=False)
 
 
-class ListingStatusSerializer(serializers.Serializer):
-    status = serializers.ChoiceField(choices=Listing.Status.choices)
+class BundleCreateSerializer(serializers.Serializer):
+    name = serializers.CharField(max_length=50)
+    price = serializers.IntegerField(min_value=0)
+    items = BundleItemSerializer(many=True, allow_empty=False)
+    ends_at = serializers.DateTimeField(required=False, allow_null=True)
+
+
+class CampaignStatusSerializer(serializers.Serializer):
+    status = serializers.ChoiceField(choices=["stopped", "ended"])
