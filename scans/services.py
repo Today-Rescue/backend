@@ -185,6 +185,19 @@ def scan_response(scan: ShelfScan, quantities: dict[int, int] | None = None) -> 
     }
 
 
+def latest_risks(store_id: int, target: date) -> dict[int, RiskSnapshot]:
+    """그날 마지막으로 확정한 재고 스캔(close)의 품목별 위험도. 없으면 {}"""
+    scan = (
+        ShelfScan.objects.filter(store_id=store_id, purpose=Purpose.CLOSE, status=Status.CONFIRMED,
+                                 created_at__date=target)
+        .order_by("-created_at")
+        .first()
+    )
+    if not scan:
+        return {}
+    return {r.item_id: r for r in scan.risks.all()}
+
+
 def save_risks(scan: ShelfScan, quantities: dict[int, int]) -> None:
     """확정 수량 기준 위험도 저장 (원터치 할인 대상 선택에 사용)"""
     counts = {c.item_id: c for c in scan.counts.select_related("item")}

@@ -38,15 +38,29 @@ class StoreCampaignView(APIView):
 
 
 class StoreDiscountView(APIView):
-    """POST /stores/{id}/campaigns/discount  body: {discount_rate, item_ids, ends_at?}"""
+    """GET /stores/{id}/campaigns/discount?discount_rate=30  할인 화면 품목 체크리스트 (SL-02)
+    POST /stores/{id}/campaigns/discount  body: {discount_rate?, item_ids?, ends_at?}
+
+    - item_ids 생략: 원터치 할인 (MN-05), 마지막 재고 스캔의 위험·주의 품목
+    - discount_rate 생략: 30, ends_at 생략: 오늘 마감 시각
+    """
+
+    def get(self, request, store_id):
+        store = get_object_or_404(Store, pk=store_id)
+        try:
+            rate = int(request.query_params.get("discount_rate", 30))
+        except ValueError:
+            rate = 0
+        if rate not in services.DISCOUNT_RATES:
+            raise AppError("INVALID_RATE", "할인율은 20, 30, 40, 50 중 하나예요")
+        return Response(services.discount_options(store, rate))
 
     def post(self, request, store_id):
         store = get_object_or_404(Store, pk=store_id)
         s = DiscountCreateSerializer(data=request.data)
         s.is_valid(raise_exception=True)
-        campaign = services.start_discount(
-            store, s.validated_data["discount_rate"], s.validated_data["item_ids"], s.validated_data.get("ends_at")
-        )
+        d = s.validated_data
+        campaign = services.start_discount(store, d["discount_rate"], d.get("item_ids"), d.get("ends_at"))
         return Response(services.campaign_response(campaign), status=201)
 
 
