@@ -12,8 +12,8 @@ from items.models import Item
 from records.services import update_left_qty
 from uploads.services import resize_image, save_bytes
 
-from . import clients
-from .models import ScanCount, ShelfScan
+from . import clients, risk
+from .models import RiskSnapshot, ScanCount, ShelfScan
 
 PROMPT_PATH = Path(__file__).parent / "prompts" / "shelf_scan.txt"
 DARK_THRESHOLD = 35  # 평균 밝기(0~255)가 이보다 낮으면 AI 호출 없이 too_dark
@@ -129,34 +129,72 @@ def create_scan(store, image_file, purpose: str | None = None) -> ShelfScan:
     return scan
 
 
-def scan_response(scan: ShelfScan) -> dict:
-    """프론트 응답용. items는 가게 전체 품목 (못 찾은 품목이 맨 위, CP-05)"""
+def scan_response(scan: ShelfScan, quantities: dict[int, int] | None = None) -> dict:
+    """프론트 응답용. items는 가게 전체 품목
+
+    - 정렬: 못 찾은 품목 맨 위 (CP-05) → 위험 → 주의 → 여유 (SR-04)
+    - 재고 스캔(close)이면 품목별 위험도와 risk_summary(SR-03)를 함께 내려줌. open이면 null
+    - quantities를 주면 그 수량으로 다시 계산 (SR-02 수정 즉시 재계산)
+    """
     counts = list(scan.counts.select_related("item").order_by("item_id"))
     items = []
     for c in counts:
         found = c.detected_qty is not None
+        qty = c.confirmed_qty if c.confirmed_qty is not None else (c.detected_qty or 0)
+        if quantities and c.item_id in quantities:
+            qty = quantities[c.item_id]
         items.append({
             "item_id": c.item_id,
             "name": c.item.name,
             "image_url": c.item.image_url,
+            "shelf_life": c.item.shelf_life,
             "found": found,
-            "quantity": c.confirmed_qty if c.confirmed_qty is not None else (c.detected_qty or 0),
+            "quantity": qty,
             "detected_qty": c.detected_qty,
             "confidence": c.confidence,
             "needs_check": (not found) or c.confidence < CONFIDENCE_THRESHOLD,
+            "level": None,
+            "expected_left": None,
+            "reason": None,
         })
-    items.sort(key=lambda x: x["found"])  # 못 찾은 품목 먼저 (안정 정렬이라 나머지 순서 유지)
+
+    summary = None
+    if scan.purpose == Purpose.CLOSE:
+        qty_map = {x["item_id"]: x["quantity"] for x in items}
+        risks = risk.evaluate(scan.store, scan.created_at, [c.item for c in counts], qty_map)
+        for x in items:
+            r = risks[x["item_id"]]
+            x.update(level=r.level, expected_left=r.expected_left, reason=r.reason)
+        summary = risk.summarize(risks, qty_map)
+        items.sort(key=lambda x: (x["found"], risk.LEVEL_ORDER[x["level"]]))
+    else:
+        items.sort(key=lambda x: x["found"])  # 안정 정렬이라 나머지 순서 유지
+
     found_count = sum(1 for x in items if x["found"])
     return {
         "scan_id": scan.id,
         "purpose": scan.purpose,
         "status": scan.status,
         "image_url": scan.image_url,
+        "scanned_at": timezone.localtime(scan.created_at).isoformat(timespec="minutes"),
         "found_count": found_count,
         "total_count": len(items),
         "total_quantity": sum(x["quantity"] for x in items),
+        "risk_summary": summary,
         "items": items,
     }
+
+
+def save_risks(scan: ShelfScan, quantities: dict[int, int]) -> None:
+    """확정 수량 기준 위험도 저장 (원터치 할인 대상 선택에 사용)"""
+    counts = {c.item_id: c for c in scan.counts.select_related("item")}
+    qty_map = {i: quantities.get(i, c.confirmed_qty or 0) for i, c in counts.items()}
+    risks = risk.evaluate(scan.store, scan.created_at, [c.item for c in counts.values()], qty_map)
+    RiskSnapshot.objects.filter(scan=scan).delete()
+    RiskSnapshot.objects.bulk_create([
+        RiskSnapshot(scan=scan, item_id=i, expected_left=r.expected_left, level=r.level, reason=r.reason)
+        for i, r in risks.items()
+    ])
 
 
 @transaction.atomic
@@ -196,6 +234,7 @@ def confirm_scan(scan: ShelfScan, target_date: date, items: list[dict], purpose:
                         [{"item_id": i, "qty": q} for i, q in quantities.items()])
     else:
         update_left_qty(scan.store_id, target_date, quantities)
+        save_risks(scan, quantities)
     scan.status = Status.CONFIRMED
     scan.confirmed_result = {"date": target_date.isoformat()}
     scan.save()

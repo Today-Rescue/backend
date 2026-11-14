@@ -9,7 +9,7 @@ from stores.models import Store
 
 from . import services
 from .models import ShelfScan
-from .serializers import ConfirmSerializer
+from .serializers import ConfirmSerializer, RiskPreviewSerializer
 
 
 def _absolute(request, data: dict) -> dict:
@@ -59,6 +59,20 @@ class ScanDetailView(APIView):
     def get(self, request, pk):
         scan = get_object_or_404(ShelfScan, pk=pk)
         return Response(_absolute(request, services.scan_response(scan)))
+
+
+class ScanRiskView(APIView):
+    """POST /scans/{id}/risk  body: {items:[{item_id, quantity}]}
+
+    확정 전에 수정한 수량으로 총 재고·위험도를 다시 계산 (SR-02·03). 저장하지 않음
+    """
+
+    def post(self, request, pk):
+        scan = get_object_or_404(ShelfScan, pk=pk)
+        s = RiskPreviewSerializer(data=request.data)
+        s.is_valid(raise_exception=True)
+        quantities = {r["item_id"]: r["quantity"] for r in s.validated_data["items"]}
+        return Response(_absolute(request, services.scan_response(scan, quantities)))
 
 
 class ScanConfirmView(APIView):
