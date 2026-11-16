@@ -126,7 +126,7 @@ class StoreBundleView(APIView):
 class CampaignSalesView(APIView):
     """GET /campaigns/{id}/sales   판매 내역 (최근 순)
     POST /campaigns/{id}/sales  판매 확정 → 남은 수량 차감
-      일괄 할인: {channel: daangn|store, items:[{item_id, quantity}]}
+      일괄 할인: {channel: app|store, items:[{item_id, quantity}]}  (app 오늘구조대 판매, store 매장 자체 판매)
       세트: {channel, packs}
     """
 
