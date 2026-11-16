@@ -71,8 +71,17 @@ def leftover_streak(store_id: int, item_id: int, until: date) -> tuple[int, floa
     return len(streak), (sum(streak) / len(streak) if streak else 0.0)
 
 
+def last_business_day(store_id: int, target: date) -> date:
+    """추천일 이전 마지막 영업일 (만든 수량 기록이 있는 날). 쉬는 날을 건너뛰어요. 없으면 전날"""
+    last = (
+        DailyRecord.objects.filter(store_id=store_id, date__lt=target, made_qty__gt=0)
+        .order_by("-date").values_list("date", flat=True).first()
+    )
+    return last or target - timedelta(days=1)
+
+
 def build_recommendation(store, target: date) -> dict:
-    today = target - timedelta(days=1)
+    today = last_business_day(store.id, target)
     items = list(Item.objects.filter(store=store, is_active=True).order_by("id"))
     today_rec = {r.item_id: r for r in DailyRecord.objects.filter(store=store, date=today)}
     closes = {c.item_id: c for c in CloseRecord.objects.filter(store=store, date=today)}
@@ -145,6 +154,7 @@ def build_recommendation(store, target: date) -> dict:
     basis = "같은 요일 평균" if enough else "오늘 판매"
     return {
         "date": target.isoformat(),
+        "base_date": today.isoformat(),  # '오늘'로 비교한 마지막 영업일
         "is_closed_day": WEEKDAYS[target.weekday()] in (store.closed_days or []),
         # RE-01
         "total": total,
