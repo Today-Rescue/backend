@@ -140,7 +140,7 @@ class Command(BaseCommand):
                         for qty in split_qty(r["sold"], rng.choice([1, 2, 3]), rng):
                             event = SalesEvent.objects.create(
                                 campaign=campaign, item=r["item"], quantity=qty, unit_price=sale_price,
-                                channel=rng.choices(["daangn", "store"], weights=[7, 3])[0],
+                                channel=rng.choices(["app", "store"], weights=[7, 3])[0],
                             )
                             SalesEvent.objects.filter(pk=event.pk).update(
                                 sold_at=at(day, 19 + rng.randint(0, 1), rng.randint(0, 59))

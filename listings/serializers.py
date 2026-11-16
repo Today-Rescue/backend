@@ -48,6 +48,6 @@ class SaleItemSerializer(serializers.Serializer):
 class SalesCreateSerializer(serializers.Serializer):
     """일괄 할인은 items, 세트는 packs"""
 
-    channel = serializers.ChoiceField(choices=["daangn", "store"])
+    channel = serializers.ChoiceField(choices=["app", "store"])  # 오늘구조대 판매 / 매장 자체 판매
     items = SaleItemSerializer(many=True, required=False)
     packs = serializers.IntegerField(min_value=1, required=False)
