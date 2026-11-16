@@ -34,7 +34,7 @@ class CampaignItem(models.Model):
     """세일 대상 품목. start_qty는 세일 시작 시점 남은 수량 (마감 때 할인 판매 수 계산용)"""
 
     campaign = models.ForeignKey(SaleCampaign, on_delete=models.CASCADE, related_name="items")
-    item = models.ForeignKey("items.Item", on_delete=models.PROTECT)
+    item = models.ForeignKey("items.Item", on_delete=models.RESTRICT)
     sale_price = models.IntegerField()  # 할인가 (원)
     start_qty = models.IntegerField(null=True)  # 모르면 null
 
@@ -63,7 +63,7 @@ class SalesEvent(models.Model):
         STORE = "store"  # 매장 자체 판매 (매장에서 바로 결제)
 
     campaign = models.ForeignKey(SaleCampaign, on_delete=models.CASCADE, related_name="sales")
-    item = models.ForeignKey("items.Item", on_delete=models.PROTECT, null=True, blank=True)
+    item = models.ForeignKey("items.Item", on_delete=models.RESTRICT, null=True, blank=True)
     quantity = models.IntegerField()
     unit_price = models.IntegerField()  # 판매가 (할인가 또는 팩 가격)
     channel = models.CharField(max_length=20, choices=Channel.choices)
@@ -72,7 +72,7 @@ class SalesEvent(models.Model):
 
 class BundleItem(models.Model):
     bundle = models.ForeignKey(Bundle, on_delete=models.CASCADE, related_name="items")
-    item = models.ForeignKey("items.Item", on_delete=models.PROTECT)
+    item = models.ForeignKey("items.Item", on_delete=models.RESTRICT)
     per_pack = models.IntegerField()  # 팩당 개수
 
     class Meta:
