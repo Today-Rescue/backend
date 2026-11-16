@@ -183,11 +183,28 @@ def next_week_suggestion(store, waste: dict, discount: dict, frequent: list[dict
     return None
 
 
+def closed_until_date(store_id: int, start: date, end: date) -> date | None:
+    """그 주에서 마감 기록이 있는 마지막 날. 없으면 None"""
+    return (
+        CloseRecord.objects.filter(store_id=store_id, date__range=(start, end))
+        .order_by("-date").values_list("date", flat=True).first()
+    )
+
+
 def build_dashboard(store, week: date) -> dict:
     start = week_start_of(week)
     this = daily_waste(store.id, start)
     last = daily_waste(store.id, start - timedelta(days=7))
-    waste = waste_summary(this, last)
+    # 진행 중인 주는 마감 기록이 있는 마지막 요일까지만, 지난주도 같은 요일까지 비교
+    end = start + timedelta(days=6)
+    closed_until = end if end < timezone.localdate() else closed_until_date(store.id, start, end)
+    if closed_until is None:
+        this_cmp, last_cmp = {}, {}
+    else:
+        this_cmp = {d: v for d, v in this.items() if d <= closed_until}
+        last_cmp = {d: v for d, v in last.items() if d <= closed_until - timedelta(days=7)}
+    waste = waste_summary(this_cmp, last_cmp)
+    waste["compared_until"] = WEEKDAYS[closed_until.weekday()] if closed_until else None
     discount = discount_summary(store.id, start)
     daily, comment = daily_compare(start, this, last)
     until = min(start + timedelta(days=6), timezone.localdate())
