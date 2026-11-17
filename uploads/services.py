@@ -1,12 +1,10 @@
 import io
-import uuid
 
-from django.core.files.base import ContentFile
-from django.core.files.storage import default_storage
-from django.utils import timezone
 from PIL import Image, ImageOps, UnidentifiedImageError
 
 from common.exceptions import AppError
+
+from .models import StoredImage
 
 MAX_SIDE = 1600  # px. 긴 변 기준으로 줄임
 MAX_UPLOAD_BYTES = 15 * 1024 * 1024  # 15MB
@@ -30,12 +28,17 @@ def resize_image(file) -> bytes:
     return buf.getvalue()
 
 
+def image_path(image_id) -> str:
+    return f"/api/v1/images/{image_id}.jpg"
+
+
 def save_bytes(data: bytes, folder: str = "uploads") -> str:
-    """JPEG bytes 저장 → MEDIA 기준 URL 경로 (/media/uploads/2026/11/xxx.jpg)"""
-    now = timezone.localtime()
-    name = f"{folder}/{now:%Y/%m}/{uuid.uuid4().hex}.jpg"
-    saved = default_storage.save(name, ContentFile(data))
-    return default_storage.url(saved)
+    """JPEG bytes를 DB에 저장 → URL 경로 (/api/v1/images/{id}.jpg)
+
+    Render 무료 서버는 재시작 때 서버 폴더가 비고, prod에선 /media/를 내려주지 않아서 DB에 저장해요
+    """
+    image = StoredImage.objects.create(folder=folder, data=data, size=len(data))
+    return image_path(image.id)
 
 
 def save_image(file, folder: str = "uploads") -> str:
