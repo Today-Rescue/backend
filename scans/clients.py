@@ -41,18 +41,28 @@ class AITimeout(Exception):
     """제한 시간 안에 어떤 모델도 응답하지 못함"""
 
 
-def _call(model: str, image_bytes: bytes, prompt: str, timeout: float) -> dict:
+def _image_part(data: bytes) -> dict:
+    return {"inline_data": {"mime_type": "image/jpeg", "data": base64.b64encode(data).decode()}}
+
+
+def build_parts(image_bytes: bytes, prompt: str, references: list[tuple[str, bytes]]) -> list[dict]:
+    """[품목 참고 사진들] → 진열대 사진 → 지시문 순서"""
+    parts = []
+    for label, data in references:
+        parts += [{"text": f"참고 사진: {label}"}, _image_part(data)]
+    if references:
+        parts.append({"text": "아래가 개수를 셀 진열대 사진이야."})
+    parts += [_image_part(image_bytes), {"text": prompt}]
+    return parts
+
+
+def _call(model: str, image_bytes: bytes, prompt: str, timeout: float,
+          references: list[tuple[str, bytes]] = ()) -> dict:
     res = requests.post(
         GEMINI_URL.format(model=model),
         headers={"x-goog-api-key": settings.GEMINI_API_KEY},
         json={
-            "contents": [{
-                "parts": [
-                    {"inline_data": {"mime_type": "image/jpeg",
-                                     "data": base64.b64encode(image_bytes).decode()}},
-                    {"text": prompt},
-                ],
-            }],
+            "contents": [{"parts": build_parts(image_bytes, prompt, list(references))}],
             "generationConfig": {
                 "temperature": 0,
                 "responseMimeType": "application/json",
@@ -66,9 +76,11 @@ def _call(model: str, image_bytes: bytes, prompt: str, timeout: float) -> dict:
     return json.loads(text)
 
 
-def analyze_shelf(image_bytes: bytes, prompt: str, deadline: float) -> tuple[dict, str]:
+def analyze_shelf(image_bytes: bytes, prompt: str, deadline: float,
+                  references: list[tuple[str, bytes]] = ()) -> tuple[dict, str]:
     """진열대 사진 → ({status, items:[{item_id, quantity, confidence}]}, 사용한 모델)
 
+    references: [(라벨 "item_id=3 소금빵", 참고 사진 JPEG)] — 품목 사진이 있으면 함께 보내 구분을 도와요
     settings.GEMINI_MODELS 순서대로 시도. deadline(time.monotonic 기준)까지 못 받으면 AITimeout
     """
     models = settings.GEMINI_MODELS
@@ -79,7 +91,7 @@ def analyze_shelf(image_bytes: bytes, prompt: str, deadline: float) -> tuple[dic
         if timeout < MIN_ATTEMPT_SECONDS:
             continue
         try:
-            return _call(model, image_bytes, prompt, timeout=timeout), model
+            return _call(model, image_bytes, prompt, timeout=timeout, references=references), model
         except (requests.RequestException, KeyError, IndexError, ValueError) as e:
             logger.warning("gemini %s failed: %s", model, e)
     raise AITimeout()
