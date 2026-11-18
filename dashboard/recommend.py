@@ -71,6 +71,26 @@ def leftover_streak(store_id: int, item_id: int, until: date) -> tuple[int, floa
     return len(streak), (sum(streak) / len(streak) if streak else 0.0)
 
 
+def step_rows(rows: list[tuple[str, int]], weather_change: float, holiday_change: float) -> list[dict]:
+    """RE-03 단계별 총량 + 이전 단계 대비 증감률
+
+    날씨·공휴일은 적용한 보정률 그대로(예: -0.15), 마감 결과는 실제 총량 변화율. 첫 단계는 null
+    """
+    result = []
+    for i, (label, total) in enumerate(rows):
+        if i == 0:
+            rate = None
+        elif i == 1:
+            rate = weather_change
+        elif i == 2:
+            rate = holiday_change
+        else:
+            prev = rows[i - 1][1]
+            rate = round((total - prev) / prev, 2) if prev else None
+        result.append({"label": label, "total": total, "change_rate": rate})
+    return result
+
+
 def last_business_day(store_id: int, target: date) -> date:
     """추천일 이전 마지막 영업일 (만든 수량 기록이 있는 날). 쉬는 날을 건너뛰어요. 없으면 전날"""
     last = (
@@ -170,12 +190,12 @@ def build_recommendation(store, target: date) -> dict:
             "sources": [SOURCES["weather"], SOURCES["holiday"]],
         },
         # RE-03
-        "steps": [
-            {"label": basis, "total": round(steps["base"])},
-            {"label": "날씨 보정", "total": round(steps["weather"])},
-            {"label": "공휴일 보정", "total": round(steps["holiday"])},
-            {"label": "마감 결과 보정", "total": total},
-        ],
+        "steps": step_rows([
+            (basis, round(steps["base"])),
+            ("날씨 보정", round(steps["weather"])),
+            ("공휴일 보정", round(steps["holiday"])),
+            ("마감 결과 보정", total),
+        ], weather_change, holiday_change),
         # RE-04
         "items": rows,
     }

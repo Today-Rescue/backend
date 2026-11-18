@@ -482,6 +482,8 @@ def _bundle_live(c: SaleCampaign) -> dict:
         "packs": b.packs, "sold_packs": sold, "left_packs": max(b.packs - sold, 0),
         "progress": round(sold / b.packs, 2) if b.packs else 0.0,
         "channels": _channel_counts(c),
+        "composition": [{"item_id": bi.item_id, "name": bi.item.name, "per_pack": bi.per_pack}
+                        for bi in b.items.select_related("item").order_by("item_id")],
     }
 
 
@@ -493,6 +495,25 @@ def live_status(store) -> dict:
     closes = default_ends_at(store)
     return {
         "minutes_to_close": _minutes(now, closes) if closes else None,
+        "last_scan": last_stock_scan(store.id),
         "discount": _discount_live(discount, now) if discount else None,
         "bundle": _bundle_live(bundle) if bundle else None,
+    }
+
+
+def last_stock_scan(store_id: int) -> dict | None:
+    """오늘 마지막으로 확정한 재고 스캔(close). 없으면 None"""
+    scan = (
+        ShelfScan.objects.filter(store_id=store_id, purpose=ShelfScan.Purpose.CLOSE,
+                                 status=ShelfScan.Status.CONFIRMED, created_at__date=timezone.localdate())
+        .order_by("-created_at").first()
+    )
+    if not scan:
+        return None
+    counts = {c.item_id: c.confirmed_qty or 0 for c in scan.counts.all()}
+    return {
+        "scan_id": scan.id,
+        "scanned_at": timezone.localtime(scan.created_at).isoformat(timespec="minutes"),
+        "total_quantity": sum(counts.values()),
+        "items": [{"item_id": i, "quantity": q} for i, q in sorted(counts.items())],
     }
