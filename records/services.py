@@ -2,6 +2,7 @@ from datetime import date, timedelta
 
 from django.db import transaction
 from django.db.models import Avg, Count, F, Q, QuerySet, Sum
+from django.db.models.functions import Greatest
 
 from common.exceptions import AppError
 from items.models import Item
@@ -19,6 +20,18 @@ def update_left_qty(store_id: int, date: date, quantities: dict[int, int]) -> No
             defaults={"store_id": store_id, "left_qty": left},
             create_defaults={"store_id": store_id, "left_qty": left, "made_qty": 0},
         )
+
+
+def apply_sale(store_id: int, date: date, item_id: int, qty: int) -> None:
+    """판매 수량만큼 확정된 남은 수량을 차감해요. 최소 수량은 0이에요."""
+    if qty <= 0:
+        raise AppError("INVALID_QTY", "판매 수량은 1개 이상이어야 해요")
+
+    updated = DailyRecord.objects.filter(
+        store_id=store_id, date=date, item_id=item_id, left_qty__isnull=False
+    ).update(left_qty=Greatest(F("left_qty") - qty, 0))
+    if not updated:
+        raise AppError("LEFT_NOT_CONFIRMED", "남은 수량이 아직 확정되지 않았어요")
 
 
 def get_records(store_id: int, start: date, end: date) -> QuerySet[DailyRecord]:
