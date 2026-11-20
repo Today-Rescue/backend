@@ -53,6 +53,23 @@ def _store_items(store_id: int, item_ids: list[int]) -> list[Item]:
     return items
 
 
+def close_stale_campaigns(store_id: int, include_expired: bool = False) -> int:
+    """종료를 안 누르고 넘어간 세일 자동 종료. 지난 날 시작한 진행 중 세일 → ended
+
+    include_expired면 오늘 세일 중 종료 예정 시각이 지난 것도 종료 (새 할인 시작 때)
+    """
+    now = timezone.now()
+    active = SaleCampaign.objects.filter(store_id=store_id, status=SaleCampaign.Status.ACTIVE)
+    stale = [c for c in active
+             if timezone.localtime(c.started_at).date() < timezone.localdate()
+             or (include_expired and c.ends_at and c.ends_at <= now)]
+    for c in stale:
+        c.status = SaleCampaign.Status.ENDED
+        c.stopped_at = min(c.ends_at, now) if c.ends_at else now
+        c.save(update_fields=["status", "stopped_at", "updated_at"])
+    return len(stale)
+
+
 def active_discount(store_id: int) -> SaleCampaign | None:
     return SaleCampaign.objects.filter(
         store_id=store_id, type=SaleCampaign.Type.DISCOUNT, status=SaleCampaign.Status.ACTIVE
@@ -109,7 +126,9 @@ def start_discount(store, rate: int, item_ids: list[int] | None, ends_at: dateti
 
     item_ids가 없으면 원터치 할인 (MN-05): 마지막 재고 스캔의 위험·주의 품목
     ends_at이 없으면 오늘 마감 시각
+    지난 날 세일·종료 시각이 지난 세일은 자동 종료하고 시작 (종료를 안 누르고 넘어간 경우)
     """
+    close_stale_campaigns(store.id, include_expired=True)
     if active_discount(store.id):
         raise AppError("DISCOUNT_ALREADY_ACTIVE", "이미 진행 중인 할인이 있어요")
     if not item_ids:
@@ -490,6 +509,7 @@ def _bundle_live(c: SaleCampaign) -> dict:
 def live_status(store) -> dict:
     """마감 세일 현황 (LV-01~04). 오늘 일괄 할인·세트 각각 최신 1개"""
     now = timezone.now()
+    close_stale_campaigns(store.id)
     discount = _latest_today(store.id, SaleCampaign.Type.DISCOUNT)
     bundle = _latest_today(store.id, SaleCampaign.Type.BUNDLE)
     closes = default_ends_at(store)
