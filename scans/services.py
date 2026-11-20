@@ -9,8 +9,10 @@ from PIL import Image, ImageStat
 
 from common.exceptions import AppError
 from items.models import Item
+from listings.actions import log_action
+from listings.models import ActionLog
 from records.services import update_left_qty
-from uploads.services import resize_image, save_bytes
+from uploads.services import load_image, resize_image, save_bytes, thumbnail
 
 from . import clients, risk
 from .models import RiskSnapshot, ScanCount, ShelfScan
@@ -19,6 +21,7 @@ PROMPT_PATH = Path(__file__).parent / "prompts" / "shelf_scan.txt"
 DARK_THRESHOLD = 35  # 평균 밝기(0~255)가 이보다 낮으면 AI 호출 없이 too_dark
 TIME_LIMIT = 20  # 초. 넘으면 timeout (CP-04)
 CONFIDENCE_THRESHOLD = 0.7  # 이보다 낮으면 "개수 확인 필요" (SR-06)
+MAX_REFERENCES = 12  # AI에 함께 보내는 품목 참고 사진 수 상한 (응답 시간)
 
 Status = ShelfScan.Status
 Purpose = ShelfScan.Purpose
@@ -34,8 +37,28 @@ def recommended_purpose(store, now: datetime | None = None) -> str:
     return Purpose.OPEN if now.replace(tzinfo=None) < alert_at else Purpose.CLOSE
 
 
-def load_prompt(items) -> str:
-    item_lines = "\n".join(f"- item_id={it.id}: {it.name}" for it in items)
+def reference_images(items) -> dict[int, bytes]:
+    """품목 사진이 있는 품목의 작은 참고 사진 {item_id: JPEG} (최대 MAX_REFERENCES개)
+
+    사진이 없거나 우리 서버 사진이 아니면 건너뛰고 이름으로만 인식해요 (12장 MVP)
+    """
+    refs = {}
+    for it in items:
+        if len(refs) >= MAX_REFERENCES:
+            break
+        data = load_image(it.image_url)
+        if data:
+            try:
+                refs[it.id] = thumbnail(data)
+            except OSError:
+                continue
+    return refs
+
+
+def load_prompt(items, ref_ids: set[int] = frozenset()) -> str:
+    item_lines = "\n".join(
+        f"- item_id={it.id}: {it.name}" + (" (참고 사진 있음)" if it.id in ref_ids else "") for it in items
+    )
     return PROMPT_PATH.read_text(encoding="utf-8").replace("{items}", item_lines)
 
 
@@ -98,12 +121,15 @@ def create_scan(store, image_file, purpose: str | None = None) -> ShelfScan:
         scan.llm_result = {"checked_by": "brightness"}
     else:
         deadline = time.monotonic() + TIME_LIMIT
-        prompt = load_prompt(items)
+        refs = reference_images(items)
+        names = {it.id: it.name for it in items}
+        references = [(f"item_id={i} {names[i]}", data) for i, data in refs.items()]
+        prompt = load_prompt(items, set(refs))
         valid_ids = {it.id for it in items}
         scan.status = Status.TIMEOUT
         while time.monotonic() < deadline:  # 응답 형식이 틀리면 남은 시간 안에서 다시
             try:
-                raw, model = clients.analyze_shelf(image_bytes, prompt, deadline)
+                raw, model = clients.analyze_shelf(image_bytes, prompt, deadline, references)
                 ai_status, found = parse_result(raw, valid_ids)
             except clients.AITimeout:
                 break
@@ -248,6 +274,15 @@ def confirm_scan(scan: ShelfScan, target_date: date, items: list[dict], purpose:
     else:
         update_left_qty(scan.store_id, target_date, quantities)
         save_risks(scan, quantities)
+
+    total = sum(quantities.values())
+    if scan.purpose == Purpose.OPEN:
+        message = f"최초 진열 기록 · 오늘 만든 빵 {total}개"
+    else:
+        flagged = scan.risks.filter(level__in=[RiskSnapshot.Level.DANGER, RiskSnapshot.Level.CAUTION]).count()
+        message = f"재고 기록 · 남은 빵 {total}개" + (f", 위험·주의 {flagged}종" if flagged else "")
+    log_action(scan.store_id, ActionLog.Type.SCAN, message,
+               {"scan_id": scan.id, "purpose": scan.purpose, "total": total}, date=target_date)
     scan.status = Status.CONFIRMED
     scan.confirmed_result = {"date": target_date.isoformat()}
     scan.save()

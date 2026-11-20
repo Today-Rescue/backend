@@ -10,7 +10,8 @@ from scans.models import RiskSnapshot, ScanCount, ShelfScan
 from scans.services import latest_risks
 
 from . import bundles, clients
-from .models import Bundle, BundleItem, CampaignItem, SaleCampaign, SalesEvent
+from .actions import log_action
+from .models import ActionLog, Bundle, BundleItem, CampaignItem, SaleCampaign, SalesEvent
 
 DISCOUNT_RATES = (20, 30, 40, 50)
 RISK_TARGETS = {RiskSnapshot.Level.DANGER, RiskSnapshot.Level.CAUTION}
@@ -129,6 +130,8 @@ def start_discount(store, rate: int, item_ids: list[int] | None, ends_at: dateti
                      start_qty=left.get(it.id))
         for it in items
     ])
+    log_action(store.id, ActionLog.Type.SALE_START, f"일괄 {rate}% 할인 시작 · {len(items)}개 품목",
+               {"campaign_id": campaign.id, "discount_rate": rate, "item_ids": sorted(it.id for it in items)})
     return campaign
 
 
@@ -143,6 +146,8 @@ def update_discount(campaign: SaleCampaign, rate: int | None, item_ids: list[int
     _ensure_active(campaign)
     if campaign.type != SaleCampaign.Type.DISCOUNT:
         raise AppError("NOT_DISCOUNT", "일괄 할인만 수정할 수 있어요")
+    old_rate = campaign.discount_rate
+    old_ids = sorted(campaign.items.values_list("item_id", flat=True))
     if rate is not None:
         campaign.discount_rate = rate
         campaign.save(update_fields=["discount_rate", "updated_at"])
@@ -161,6 +166,17 @@ def update_discount(campaign: SaleCampaign, rate: int | None, item_ids: list[int
     for ci in campaign.items.select_related("item"):  # 할인가 다시 계산
         ci.sale_price = sale_price(ci.item.price, campaign.discount_rate)
         ci.save(update_fields=["sale_price"])
+
+    new_ids = sorted(campaign.items.values_list("item_id", flat=True))
+    changes = []
+    if campaign.discount_rate != old_rate:
+        changes.append(f"할인율 {old_rate}% → {campaign.discount_rate}%")
+    if new_ids != old_ids:
+        changes.append(f"할인 품목 {len(old_ids)}개 → {len(new_ids)}개")
+    if changes:
+        log_action(campaign.store_id, ActionLog.Type.SALE_UPDATE, " · ".join(changes) + " 변경",
+                   {"campaign_id": campaign.id, "from_rate": old_rate, "to_rate": campaign.discount_rate,
+                    "item_ids": new_ids})
     return campaign
 
 
@@ -170,6 +186,10 @@ def stop_campaign(campaign: SaleCampaign, status: str) -> SaleCampaign:
     campaign.status = status
     campaign.stopped_at = timezone.now()
     campaign.save(update_fields=["status", "stopped_at", "updated_at"])
+    kind = "일괄 할인" if campaign.type == SaleCampaign.Type.DISCOUNT else "세트 판매"
+    verb = "중지" if status == SaleCampaign.Status.STOPPED else "종료"
+    log_action(campaign.store_id, ActionLog.Type.SALE_STOP, f"{kind} {verb}",
+               {"campaign_id": campaign.id, "status": status})
     return campaign
 
 
@@ -304,6 +324,8 @@ def start_bundle(store, name: str, price: int, rows: list[dict], ends_at: dateti
     ])
     bundle = Bundle.objects.create(campaign=campaign, name=name, price=price, packs=packs)
     BundleItem.objects.bulk_create([BundleItem(bundle=bundle, item=items[i], per_pack=n) for i, n in per_pack.items()])
+    log_action(store.id, ActionLog.Type.BUNDLE_START, f"세트 '{name}' {packs}팩 등록",
+               {"campaign_id": campaign.id, "packs": packs, "price": price})
     return campaign
 
 
@@ -460,6 +482,8 @@ def _bundle_live(c: SaleCampaign) -> dict:
         "packs": b.packs, "sold_packs": sold, "left_packs": max(b.packs - sold, 0),
         "progress": round(sold / b.packs, 2) if b.packs else 0.0,
         "channels": _channel_counts(c),
+        "composition": [{"item_id": bi.item_id, "name": bi.item.name, "per_pack": bi.per_pack}
+                        for bi in b.items.select_related("item").order_by("item_id")],
     }
 
 
@@ -471,6 +495,25 @@ def live_status(store) -> dict:
     closes = default_ends_at(store)
     return {
         "minutes_to_close": _minutes(now, closes) if closes else None,
+        "last_scan": last_stock_scan(store.id),
         "discount": _discount_live(discount, now) if discount else None,
         "bundle": _bundle_live(bundle) if bundle else None,
+    }
+
+
+def last_stock_scan(store_id: int) -> dict | None:
+    """오늘 마지막으로 확정한 재고 스캔(close). 없으면 None"""
+    scan = (
+        ShelfScan.objects.filter(store_id=store_id, purpose=ShelfScan.Purpose.CLOSE,
+                                 status=ShelfScan.Status.CONFIRMED, created_at__date=timezone.localdate())
+        .order_by("-created_at").first()
+    )
+    if not scan:
+        return None
+    counts = {c.item_id: c.confirmed_qty or 0 for c in scan.counts.all()}
+    return {
+        "scan_id": scan.id,
+        "scanned_at": timezone.localtime(scan.created_at).isoformat(timespec="minutes"),
+        "total_quantity": sum(counts.values()),
+        "items": [{"item_id": i, "quantity": q} for i, q in sorted(counts.items())],
     }

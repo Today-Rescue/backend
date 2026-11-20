@@ -9,6 +9,7 @@ from common.exceptions import AppError
 from stores.models import Store
 
 from . import services
+from .actions import get_actions
 from .models import SaleCampaign
 from .serializers import (
     BundleCalculateSerializer,
@@ -125,7 +126,7 @@ class StoreBundleView(APIView):
 class CampaignSalesView(APIView):
     """GET /campaigns/{id}/sales   판매 내역 (최근 순)
     POST /campaigns/{id}/sales  판매 확정 → 남은 수량 차감
-      일괄 할인: {channel: daangn|store, items:[{item_id, quantity}]}
+      일괄 할인: {channel: app|store, items:[{item_id, quantity}]}  (app 오늘구조대 판매, store 매장 자체 판매)
       세트: {channel, packs}
     """
 
@@ -154,3 +155,18 @@ class StoreLiveView(APIView):
     def get(self, request, store_id):
         store = get_object_or_404(Store, pk=store_id)
         return Response(services.live_status(store))
+
+
+class StoreActionsView(APIView):
+    """GET /stores/{id}/actions?date=2026-11-14  마감 행동 타임라인 (RC-04), 시각순
+
+    type: scan / sale_start / bundle_start / sale_update / sale_stop / close
+    """
+
+    def get(self, request, store_id):
+        get_object_or_404(Store, pk=store_id)
+        try:
+            target = date.fromisoformat(request.query_params.get("date") or timezone.localdate().isoformat())
+        except ValueError:
+            raise AppError("INVALID_DATE", "날짜는 2026-11-14 형식으로 보내 주세요")
+        return Response(get_actions(store_id, target))
