@@ -17,7 +17,7 @@ from common.exceptions import AppError
 from items.models import Item
 from records.models import CloseRecord, DailyRecord
 from stores.models import Store
-from weather.services import get_weather, is_holiday
+from weather.services import get_forecast_pop, is_holiday
 
 WEEKS = 4  # 같은 요일 평균: 최근 N주
 MIN_HISTORY_DAYS = 3  # 판매 기록이 이보다 적으면 오늘 기준으로 시작
@@ -111,8 +111,7 @@ def build_recommendation(store, target: date) -> dict:
     avg = weekday_avg_sold(store.id, target) if enough else {}
 
     # 조건 (RE-02)
-    w = get_weather(store.nx, store.ny, target) if store.nx is not None and store.ny is not None else None
-    pop = w.pop_max if w else None
+    pop = get_forecast_pop(store.nx, store.ny, target)
     weather_change = rain_change(pop)
     holiday = is_holiday(target)
     holiday_change = HOLIDAY_CHANGE if holiday else 0.0
