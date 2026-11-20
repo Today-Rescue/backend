@@ -1,10 +1,15 @@
+import logging
 from collections import defaultdict
 from datetime import date, datetime, timedelta
 
 from django.utils import timezone
 
+from common.exceptions import ExternalAPIError
+
 from . import clients
 from .models import Holiday, WeatherDaily
+
+logger = logging.getLogger(__name__)
 
 # 단기예보 발표 시각 (발표 후 약 10분 뒤부터 조회 가능)
 BASE_HOURS = [2, 5, 8, 11, 14, 17, 20, 23]
@@ -15,6 +20,32 @@ AVAILABLE_DELAY = timedelta(minutes=10)
 def get_weather(nx: int, ny: int, date: date) -> WeatherDaily | None:
     """없으면 None. 홈에서 None이면 '날씨 정보 없음' 표시"""
     return WeatherDaily.objects.filter(nx=nx, ny=ny, date=date).first()
+
+
+def get_forecast_pop(nx: int | None, ny: int | None, target: date) -> int | None:
+    """추천용 POP 조회. 예보 기간 내 저장된 값이 없으면 기상청에서 보충."""
+    if nx is None or ny is None:
+        return None
+    weather = get_weather(nx, ny, target)
+    if weather is not None and weather.pop_max is not None:
+        return weather.pop_max
+
+    now = timezone.localtime()
+    if not now.date() <= target <= now.date() + timedelta(days=3):
+        return None
+
+    try:
+        update_weather(nx, ny, latest_base(now), target_date=target)
+    except (ExternalAPIError, AttributeError, KeyError, TypeError, ValueError) as error:
+        # 요청 오류의 상세 내용에 인증키가 포함될 수 있어 유형만 기록.
+        logger.warning(
+            "Weather refresh failed for grid (%s, %s) on %s: %s",
+            nx, ny, target, type(error).__name__,
+        )
+        return None
+
+    weather = get_weather(nx, ny, target)
+    return weather.pop_max if weather is not None else None
 
 
 def is_holiday(date: date) -> bool:
@@ -63,11 +94,19 @@ def summarize_forecast(items: list[dict]) -> dict[date, dict]:
     return dict(by_date)
 
 
-def update_weather(nx: int, ny: int, base: tuple[str, str] | None = None) -> int:
+def update_weather(
+    nx: int, ny: int, base: tuple[str, str] | None = None, *, target_date: date | None = None
+) -> int:
     """(nx, ny) 단기예보 받아서 WeatherDaily 저장. 저장한 날짜 수 반환"""
     base_date, base_time = base or latest_base()
     items = clients.fetch_vilage_fcst(nx, ny, base_date, base_time)
     summary = summarize_forecast(items)
+
+    if target_date is not None:
+        day = summary.get(target_date)
+        if day is None or day["pop_max"] is None:
+            return 0
+        summary = {target_date: day}
 
     for d, day in summary.items():
         values = {"pop_max": day["pop_max"], "has_rain": day["has_rain"],
